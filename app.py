@@ -57,27 +57,27 @@ if not BOT_TOKEN:
 if not FIREBASE_CRED_VAR:
     raise RuntimeError("FIREBASE_CRED o'zgaruvchisi topilmadi (Railway Variables bo'limini tekshiring)")
 
+# Firebase initialize qilish (Faqat bir marta bo'lishi kerak!)
 try:
-    # Agar JSON formatida bo'lsa (Railway uchun)
-    if FIREBASE_CRED_VAR.strip().startswith("{"):
-        log.info("Firebase JSON matnidan yuklanmoqda...")
-        cred_dict = json.loads(FIREBASE_CRED_VAR)
-        cred = credentials.Certificate(cred_dict)
-    # Agar fayl yo'li bo'lsa (Lokal uchun)
+    if firebase_admin._apps:
+        # Agar allaqachon initialize bo'lgan bo'lsa, qayta qilmaslik uchun
+        db = firestore.client()
     else:
-        log.info(f"Firebase fayldan yuklanmoqda: {FIREBASE_CRED_VAR}")
-        if os.path.exists(FIREBASE_CRED_VAR):
-            cred = credentials.Certificate(FIREBASE_CRED_VAR)
+        if FIREBASE_CRED_VAR.strip().startswith("{"):
+            # Railway uchun: JSON matnidan yuklash
+            import json
+            cred_dict = json.loads(FIREBASE_CRED_VAR)
+            cred = credentials.Certificate(cred_dict)
         else:
-            raise FileNotFoundError(f"Firebase fayli topilmadi: {FIREBASE_CRED_VAR}")
-    
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
+            # Lokal uchun: Fayl yo'lidan yuklash
+            cred = credentials.Certificate(FIREBASE_CRED_VAR)
+            
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
     log.info("Firebase muvaffaqiyatli ulandi.")
 except Exception as e:
     log.error(f"Firebase ulanishda xato: {e}")
     raise e
-
 # 3. Telegram API ma'lumotlarini tekshirish
 if not all([TG_API_ID, TG_API_HASH, TG_PHONE]):
     raise RuntimeError("TG_API_ID / TG_API_HASH / TG_PHONE topilmadi")
