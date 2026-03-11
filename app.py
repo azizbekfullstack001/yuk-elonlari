@@ -6,6 +6,7 @@ import time
 import uuid
 import hashlib
 import logging
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -53,41 +54,66 @@ TG_PHONE = os.getenv("TG_PHONE")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi")
 
-# 2. FIREBASE_CRED tekshiruvi va yuklash
+# 2. FIREBASE_CRED tekshiruvi
 if not FIREBASE_CRED_VAR:
-    raise RuntimeError("FIREBASE_CRED o'zgaruvchisi topilmadi (Railway Variables bo'limini tekshiring)")
+    raise RuntimeError("FIREBASE_CRED o'zgaruvchisi topilmadi (deploy platform Variables bo'limini tekshiring)")
 
-# Firebase initialize qilish (Faqat bir marta bo'lishi kerak!)
-try:
-    if firebase_admin._apps:
-        # Agar allaqachon initialize bo'lgan bo'lsa, qayta qilmaslik uchun
-        db = firestore.client()
-    else:
-        if FIREBASE_CRED_VAR.strip().startswith("{"):
-            # Railway uchun: JSON matnidan yuklash
-            import json
-            cred_dict = json.loads(FIREBASE_CRED_VAR)
-            cred = credentials.Certificate(cred_dict)
-        else:
-            # Lokal uchun: Fayl yo'lidan yuklash
-            cred = credentials.Certificate(FIREBASE_CRED_VAR)
-            
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-    log.info("Firebase muvaffaqiyatli ulandi.")
-except Exception as e:
-    log.error(f"Firebase ulanishda xato: {e}")
-    raise e
 # 3. Telegram API ma'lumotlarini tekshirish
 if not all([TG_API_ID, TG_API_HASH, TG_PHONE]):
     raise RuntimeError("TG_API_ID / TG_API_HASH / TG_PHONE topilmadi")
 
 TG_API_ID = int(TG_API_ID)
 
-# YANGI HOLATI
-cred = credentials.Certificate(FIREBASE_CRED_VAR)
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+
+def build_firebase_credential(firebase_cred_var: str):
+    """
+    FIREBASE_CRED quyidagi formatlarda bo'lishi mumkin:
+    1) service account JSON string
+    2) JSON fayl path
+    3) base64 encoded JSON
+    """
+    value = (firebase_cred_var or "").strip()
+
+    # 1) JSON string
+    if value.startswith("{"):
+        cred_dict = json.loads(value)
+
+    # 2) JSON file path
+    elif os.path.exists(value):
+        with open(value, "r", encoding="utf-8") as f:
+            cred_dict = json.load(f)
+
+    # 3) Base64 encoded JSON
+    else:
+        try:
+            decoded = base64.b64decode(value).decode("utf-8")
+            cred_dict = json.loads(decoded)
+        except Exception as e:
+            raise RuntimeError(
+                "FIREBASE_CRED noto'g'ri formatda. U JSON string, JSON file path yoki base64 JSON bo'lishi kerak."
+            ) from e
+
+    # private_key dagi \n larni haqiqiy newline ga aylantirish
+    if "private_key" in cred_dict and isinstance(cred_dict["private_key"], str):
+        cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+
+    return credentials.Certificate(cred_dict)
+
+
+# Firebase initialize qilish (Faqat bir marta bo'lishi kerak!)
+try:
+    if firebase_admin._apps:
+        db = firestore.client()
+    else:
+        cred = build_firebase_credential(FIREBASE_CRED_VAR)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+
+    log.info("Firebase muvaffaqiyatli ulandi.")
+except Exception as e:
+    log.exception("Firebase ulanishda xato")
+    raise
+
 
 COL_USERS = "users"
 COL_ADS = "ads_cargo"
@@ -1514,5 +1540,6 @@ async def main():
         gc_task(),
         *workers,
     )
+
 if __name__ == "__main__":
     asyncio.run(main())
