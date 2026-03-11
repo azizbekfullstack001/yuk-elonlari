@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import json
 import time
 import uuid
 import hashlib
@@ -25,7 +26,7 @@ from google.api_core.exceptions import AlreadyExists
 
 from truck import register_truck_module
 
-
+# Logging sozlamalari
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -38,18 +39,47 @@ try:
 except Exception:
     LOCAL_TZ = timezone(timedelta(hours=5))
 
+# .env faylini yuklash (Lokal uchun)
 load_dotenv()
+
+# O'zgaruvchilarni olish
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FIREBASE_CRED = os.getenv("FIREBASE_CRED")
+FIREBASE_CRED_VAR = os.getenv("FIREBASE_CRED")
 TG_API_ID = os.getenv("TG_API_ID")
 TG_API_HASH = os.getenv("TG_API_HASH")
 TG_PHONE = os.getenv("TG_PHONE")
 
+# 1. BOT_TOKEN tekshiruvi
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi")
-if not FIREBASE_CRED or not os.path.exists(FIREBASE_CRED):
-    raise RuntimeError("FIREBASE_CRED topilmadi")
-if not TG_API_ID or not TG_API_HASH or not TG_PHONE:
+
+# 2. FIREBASE_CRED tekshiruvi va yuklash
+if not FIREBASE_CRED_VAR:
+    raise RuntimeError("FIREBASE_CRED o'zgaruvchisi topilmadi (Railway Variables bo'limini tekshiring)")
+
+try:
+    # Agar JSON formatida bo'lsa (Railway uchun)
+    if FIREBASE_CRED_VAR.strip().startswith("{"):
+        log.info("Firebase JSON matnidan yuklanmoqda...")
+        cred_dict = json.loads(FIREBASE_CRED_VAR)
+        cred = credentials.Certificate(cred_dict)
+    # Agar fayl yo'li bo'lsa (Lokal uchun)
+    else:
+        log.info(f"Firebase fayldan yuklanmoqda: {FIREBASE_CRED_VAR}")
+        if os.path.exists(FIREBASE_CRED_VAR):
+            cred = credentials.Certificate(FIREBASE_CRED_VAR)
+        else:
+            raise FileNotFoundError(f"Firebase fayli topilmadi: {FIREBASE_CRED_VAR}")
+    
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    log.info("Firebase muvaffaqiyatli ulandi.")
+except Exception as e:
+    log.error(f"Firebase ulanishda xato: {e}")
+    raise e
+
+# 3. Telegram API ma'lumotlarini tekshirish
+if not all([TG_API_ID, TG_API_HASH, TG_PHONE]):
     raise RuntimeError("TG_API_ID / TG_API_HASH / TG_PHONE topilmadi")
 
 TG_API_ID = int(TG_API_ID)
