@@ -84,7 +84,8 @@ if not all([TG_API_ID, TG_API_HASH, TG_PHONE]):
 
 TG_API_ID = int(TG_API_ID)
 
-cred = credentials.Certificate(FIREBASE_CRED)
+# YANGI HOLATI
+cred = credentials.Certificate(FIREBASE_CRED_VAR)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
