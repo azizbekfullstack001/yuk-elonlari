@@ -1,36 +1,37 @@
 import asyncio
 import os
 import re
-import json
 import time
 import uuid
 import hashlib
 import logging
-import base64
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
-from concurrent.futures import ThreadPoolExecutor
 
+import asyncpg
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
 from telethon import TelegramClient, events
-
-import firebase_admin
-from firebase_admin import credentials, firestore
-from google.api_core.exceptions import AlreadyExists
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
 from truck import register_truck_module
 
-# Logging sozlamalari
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("cargo-bot")
 
@@ -40,95 +41,27 @@ try:
 except Exception:
     LOCAL_TZ = timezone(timedelta(hours=5))
 
-# .env faylini yuklash (Lokal uchun)
 load_dotenv()
 
-# O'zgaruvchilarni olish
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FIREBASE_CRED_VAR = os.getenv("FIREBASE_CRED")
+DATABASE_URL = os.getenv("DATABASE_URL")
 TG_API_ID = os.getenv("TG_API_ID")
 TG_API_HASH = os.getenv("TG_API_HASH")
-TG_PHONE = os.getenv("TG_PHONE")
+TG_SESSION = os.getenv("TG_SESSION")
 
-# 1. BOT_TOKEN tekshiruvi
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL topilmadi")
+if not TG_API_ID or not TG_API_HASH:
+    raise RuntimeError("TG_API_ID / TG_API_HASH topilmadi")
+if not TG_SESSION:
+    raise RuntimeError("TG_SESSION topilmadi")
 
-# 2. FIREBASE_CRED tekshiruvi
-if not FIREBASE_CRED_VAR:
-    raise RuntimeError("FIREBASE_CRED o'zgaruvchisi topilmadi (deploy platform Variables bo'limini tekshiring)")
-
-# 3. Telegram API ma'lumotlarini tekshirish
-if not all([TG_API_ID, TG_API_HASH, TG_PHONE]):
-    raise RuntimeError("TG_API_ID / TG_API_HASH / TG_PHONE topilmadi")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 TG_API_ID = int(TG_API_ID)
-
-
-def build_firebase_credential(firebase_cred_var: str):
-    """
-    FIREBASE_CRED quyidagi formatlarda bo'lishi mumkin:
-    1) service account JSON string
-    2) JSON fayl path
-    3) base64 encoded JSON
-    """
-    value = (firebase_cred_var or "").strip()
-
-    # 1) JSON string
-    if value.startswith("{"):
-        cred_dict = json.loads(value)
-
-    # 2) JSON file path
-    elif os.path.exists(value):
-        with open(value, "r", encoding="utf-8") as f:
-            cred_dict = json.load(f)
-
-    # 3) Base64 encoded JSON
-    else:
-        try:
-            decoded = base64.b64decode(value).decode("utf-8")
-            cred_dict = json.loads(decoded)
-        except Exception as e:
-            raise RuntimeError(
-                "FIREBASE_CRED noto'g'ri formatda. U JSON string, JSON file path yoki base64 JSON bo'lishi kerak."
-            ) from e
-
-    # private_key dagi \n larni haqiqiy newline ga aylantirish
-    if "private_key" in cred_dict and isinstance(cred_dict["private_key"], str):
-        cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-
-    return credentials.Certificate(cred_dict)
-
-
-# Firebase initialize qilish (Faqat bir marta bo'lishi kerak!)
-try:
-    if firebase_admin._apps:
-        db = firestore.client()
-    else:
-        cred = build_firebase_credential(FIREBASE_CRED_VAR)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-
-    log.info("Firebase muvaffaqiyatli ulandi.")
-except Exception as e:
-    log.exception("Firebase ulanishda xato")
-    raise
-
-
-COL_USERS = "users"
-COL_ADS = "ads_cargo"
-COL_DEDUP = "dedup"
-COL_PLACE_INDEX = "place_index"
-COL_SOURCE_MAP = "source_map"
-
-COL_TRUCKS = "ads_trucks"
-COL_TRUCK_DEDUP = "truck_dedup"
-COL_TRUCK_SOURCE_MAP = "truck_source_map"
-COL_TRUCK_COUNTRY_INDEX = "truck_country_index"
-COL_TRUCK_REGION_INDEX = "truck_region_index"
-COL_TRUCK_STATS = "truck_stats"
-COL_TRUCK_COUNTRY_STATS = "truck_stats_countries"
-COL_TRUCK_REGION_STATS = "truck_stats_regions"
 
 PAGE_SIZE = 5
 AD_TTL_DAYS = 2
@@ -145,8 +78,6 @@ INGEST_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=5000)
 WORKER_BATCH_MAX = 120
 WORKER_BATCH_WINDOW_SEC = 0.2
 
-FS_EXECUTOR = ThreadPoolExecutor(max_workers=8)
-
 RAM_DEDUP: Dict[str, float] = {}
 RAM_DEDUP_TTL = DEDUP_TTL_HOURS * 3600
 
@@ -154,23 +85,33 @@ CHAT_CACHE: Dict[int, Tuple[str, Optional[str], float]] = {}
 CHAT_CACHE_TTL = 6 * 3600
 
 SEARCH_SESSIONS: Dict[str, Dict[str, Any]] = {}
-CACHE: Dict[Tuple[str, str, str, str, str], Tuple[float, List[dict], Optional[Tuple[datetime, str]], bool]] = {}
+CACHE: Dict[
+    Tuple[str, str, str, str, str],
+    Tuple[float, List[dict], Optional[Tuple[datetime, str]], bool]
+] = {}
+
+DB_POOL: Optional[asyncpg.Pool] = None
 
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
 
 def escape_html(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
 def source_key(chat_id: int, message_id: int) -> str:
     return f"{chat_id}_{message_id}"
 
+
 def make_session_id() -> str:
     return uuid.uuid4().hex[:10]
+
 
 def cache_get(key):
     v = CACHE.get(key)
@@ -182,8 +123,10 @@ def cache_get(key):
         return None
     return items, next_cursor, has_next
 
+
 def cache_set(key, items, next_cursor, has_next):
     CACHE[key] = (time.time(), items, next_cursor, has_next)
+
 
 def shorten_text(text: str, max_len: int = 170) -> str:
     t = normalize_text(text)
@@ -192,19 +135,26 @@ def shorten_text(text: str, max_len: int = 170) -> str:
     cut = t[:max_len].rsplit(" ", 1)[0].strip()
     return (cut or t[:max_len]).strip() + "..."
 
+
 def text_hash_norm(text: str) -> str:
     t = normalize_text(text).lower()
     t = re.sub(r"[^\w\sʻ’`'ʼ\-ёқғҳў]+", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\s+", " ", t).strip()
     return hashlib.sha1(t.encode("utf-8")).hexdigest()
 
+
 def normalize_place_token(s: str) -> str:
     s = normalize_text(s).lower()
     s = s.replace("ё", "е")
     s = re.sub(r"[^\w\sʻ’`'ʼ\-қғҳў]", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b(sh|shahar|tumani|tuman|viloyati|viloyat|rayon|oblast|город|район|область)\b\.?", "", s).strip()
+    s = re.sub(
+        r"\b(sh|shahar|tumani|tuman|viloyati|viloyat|rayon|oblast|город|район|область)\b\.?",
+        "",
+        s,
+    ).strip()
     s = re.sub(r"\s+", " ", s)
     return s
+
 
 def make_message_link(chat_id: int, message_id: int, chat_username: Optional[str]) -> Optional[str]:
     if chat_username:
@@ -248,38 +198,38 @@ CARGO_WORDS = [
 
 STOP_CARGO = {
     "yuk", "юк", "bor", "есть", "kerak", "нужен", "mashina", "машина",
-    "tonna", "тонна", "kg", "кг", "dan", "ga", "тел", "tel"
+    "tonna", "тонна", "kg", "кг", "dan", "ga", "тел", "tel",
 }
 
 COUNTRY_ALIASES = {
     "uzbekistan": {
         "label": "O‘zbekiston",
-        "aliases": ["uzbekistan", "o'zbekiston", "ozbekiston", "узбекистан", "uzb", "toshkent", "ташкент"]
+        "aliases": ["uzbekistan", "o'zbekiston", "ozbekiston", "узбекистан", "uzb", "toshkent", "ташкент"],
     },
     "russia": {
         "label": "Rossiya",
-        "aliases": ["russia", "rossiya", "россия", "рф", "moskva", "москва", "piter", "питер"]
+        "aliases": ["russia", "rossiya", "россия", "рф", "moskva", "москва", "piter", "питер"],
     },
     "kazakhstan": {
         "label": "Qozog‘iston",
-        "aliases": ["kazakhstan", "қозоғистон", "казахстан", "almaty", "алматы"]
+        "aliases": ["kazakhstan", "қозоғистон", "казахстан", "almaty", "алматы"],
     },
     "kyrgyzstan": {
         "label": "Qirg‘iziston",
-        "aliases": ["kyrgyzstan", "киргизия", "кыргызстан", "bishkek", "бишкек"]
+        "aliases": ["kyrgyzstan", "киргизия", "кыргызстан", "bishkek", "бишкек"],
     },
     "tajikistan": {
         "label": "Tojikiston",
-        "aliases": ["tajikistan", "tojikiston", "таджикистан", "dushanbe", "душанбе"]
+        "aliases": ["tajikistan", "tojikiston", "таджикистан", "dushanbe", "душанбе"],
     },
     "turkey": {
         "label": "Turkiya",
-        "aliases": ["turkey", "turkiya", "турция", "istanbul", "стамбул"]
+        "aliases": ["turkey", "turkiya", "турция", "istanbul", "стамбул"],
     },
     "other": {
         "label": "Boshqa",
-        "aliases": []
-    }
+        "aliases": [],
+    },
 }
 
 UZ_REGIONS = {
@@ -337,6 +287,7 @@ def parse_phone(text: str) -> Optional[str]:
             return re.sub(r"\s+", " ", phone).strip()
     return None
 
+
 def parse_weight(text: str) -> Optional[str]:
     t = text.lower()
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*(tonna|t|kg|тонна|кг)\b", t, flags=re.IGNORECASE)
@@ -350,6 +301,7 @@ def parse_weight(text: str) -> Optional[str]:
         unit = "kg"
     return f"{val} {unit}"
 
+
 def looks_like_cargo_ad(text: str) -> bool:
     t = text.lower()
     kws = [
@@ -357,9 +309,10 @@ def looks_like_cargo_ad(text: str) -> bool:
         "mashina kerak", "машина керак", "машина нужна",
         "fura", "фура", "tent", "тент", "ref", "реф",
         "howo", "hovo", "хово", "kamaz", "камаз",
-        "isuzu", "gazel", "газель", "sprinter", "спринтер"
+        "isuzu", "gazel", "газель", "sprinter", "спринтер",
     ]
     return any(k in t for k in kws)
+
 
 def parse_route_from_to(text: str) -> Tuple[Optional[str], Optional[str]]:
     t = normalize_place_token(text)
@@ -378,6 +331,7 @@ def parse_route_from_to(text: str) -> Tuple[Optional[str], Optional[str]]:
 
     return None, None
 
+
 def extract_place_candidates(text: str) -> List[str]:
     places: List[str] = []
     a, b = parse_route_from_to(text)
@@ -394,7 +348,7 @@ def extract_place_candidates(text: str) -> List[str]:
         "тонна", "tonna", "kg", "кг", "dan", "ga", "дан", "га",
         "telefon", "tel", "телефон", "тел", "fura", "фура", "tent", "тент",
         "ref", "реф", "howo", "hovo", "хово", "kamaz", "камаз", "isuzu",
-        "gazel", "газель", "sprinter", "спринтер"
+        "gazel", "газель", "sprinter", "спринтер",
     }
 
     seen = set(places)
@@ -409,6 +363,7 @@ def extract_place_candidates(text: str) -> List[str]:
             break
     return places
 
+
 def parse_vehicle_need(text: str) -> Optional[str]:
     t = " " + text.lower() + " "
     found = []
@@ -418,6 +373,7 @@ def parse_vehicle_need(text: str) -> Optional[str]:
     if not found:
         return None
     return ", ".join(dict.fromkeys(found))
+
 
 def parse_cargo_name(text: str) -> Optional[str]:
     t = normalize_text(text.lower())
@@ -430,7 +386,12 @@ def parse_cargo_name(text: str) -> Optional[str]:
         m = re.search(p, t, flags=re.IGNORECASE)
         if m:
             val = normalize_text(m.group(1))
-            val = re.sub(r"\b(kerak|bor|есть|нужен|машина|mashina|tonna|тонна|kg|кг)\b", "", val, flags=re.IGNORECASE)
+            val = re.sub(
+                r"\b(kerak|bor|есть|нужен|машина|mashina|tonna|тонна|kg|кг)\b",
+                "",
+                val,
+                flags=re.IGNORECASE,
+            )
             val = val.strip(" -.,")
             if val and len(val) >= 3:
                 return val[:40]
@@ -456,15 +417,21 @@ def parse_cargo_name(text: str) -> Optional[str]:
 
     return None
 
+
 def looks_like_truck_ad(text: str) -> bool:
     t = normalize_text(text).lower()
     if any(re.search(p, t, flags=re.IGNORECASE) for p in TRUCK_TRIGGER_PATTERNS):
         return True
     if any(re.search(p, t, flags=re.IGNORECASE) for p in TRUCK_VEHICLE_BOR_PATTERNS):
         return True
-    if parse_truck_vehicle(text) and re.search(r"\b(bor|есть|буш|пустой|kerak|kk|нужен|нужна|нужно)\b", t, flags=re.IGNORECASE):
+    if parse_truck_vehicle(text) and re.search(
+        r"\b(bor|есть|буш|пустой|kerak|kk|нужен|нужна|нужно)\b",
+        t,
+        flags=re.IGNORECASE,
+    ):
         return True
     return False
+
 
 def parse_truck_vehicle(text: str) -> Optional[str]:
     t = " " + normalize_text(text).lower() + " "
@@ -476,11 +443,14 @@ def parse_truck_vehicle(text: str) -> Optional[str]:
         return None
     return ", ".join(dict.fromkeys(found))
 
+
 def parse_first_phone(text: str) -> Optional[str]:
     return parse_phone(text)
 
+
 def shorten_preview(text: str, max_len: int = 160) -> str:
     return shorten_text(text, max_len)
+
 
 def detect_truck_country_region(text: str):
     t = normalize_text(text).lower()
@@ -500,68 +470,75 @@ def detect_truck_country_region(text: str):
     return "other", COUNTRY_ALIASES["other"]["label"], None, None
 
 
-def users_col():
-    return db.collection(COL_USERS)
+def get_pool() -> asyncpg.Pool:
+    if DB_POOL is None:
+        raise RuntimeError("DB pool initialized emas")
+    return DB_POOL
 
-def ads_col():
-    return db.collection(COL_ADS)
 
-def dedup_col():
-    return db.collection(COL_DEDUP)
-
-def place_index_col(place: str):
-    return db.collection(COL_PLACE_INDEX).document(place).collection("ads")
-
-def source_map_col():
-    return db.collection(COL_SOURCE_MAP)
-
-def truck_ads_col():
-    return db.collection(COL_TRUCKS)
-
-def truck_dedup_col():
-    return db.collection(COL_TRUCK_DEDUP)
-
-def truck_source_map_col():
-    return db.collection(COL_TRUCK_SOURCE_MAP)
-
-def truck_country_index_col(country: str):
-    return db.collection(COL_TRUCK_COUNTRY_INDEX).document(country).collection("ads")
-
-def truck_region_index_col(country: str, region: str):
-    return (
-        db.collection(COL_TRUCK_REGION_INDEX)
-        .document(country)
-        .collection("regions")
-        .document(region)
-        .collection("ads")
+async def init_db():
+    global DB_POOL
+    DB_POOL = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=10,
+        command_timeout=60,
     )
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("select 1")
+    log.info("Supabase/Postgres muvaffaqiyatli ulandi.")
 
-def truck_summary_ref():
-    return db.collection(COL_TRUCK_STATS).document("summary")
 
-def truck_country_stats_ref(country: str):
-    return db.collection(COL_TRUCK_COUNTRY_STATS).document(country)
+async def get_user(uid: int) -> Optional[dict]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select uid, phone, tg_username, fullname, registered, created_at, updated_at
+            from users
+            where uid = $1
+            """,
+            uid,
+        )
+    return dict(row) if row else None
 
-def truck_region_stats_ref(country: str, region: str):
-    return db.collection(COL_TRUCK_REGION_STATS).document(country).collection("regions").document(region)
 
-def user_doc(uid: int):
-    return users_col().document(str(uid))
+async def save_user(uid: int, data: dict):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            insert into users (
+                uid, phone, tg_username, fullname, registered, created_at, updated_at
+            )
+            values (
+                $1, $2, $3, $4, $5, coalesce($6, now()), $7
+            )
+            on conflict (uid) do update set
+                phone = coalesce(excluded.phone, users.phone),
+                tg_username = coalesce(excluded.tg_username, users.tg_username),
+                fullname = coalesce(excluded.fullname, users.fullname),
+                registered = coalesce(excluded.registered, users.registered),
+                updated_at = excluded.updated_at
+            """,
+            uid,
+            data.get("phone"),
+            data.get("tgUsername"),
+            data.get("fullname"),
+            data.get("registered"),
+            data.get("createdAt"),
+            data.get("updatedAt", now_utc()),
+        )
 
-def get_user(uid: int) -> Optional[dict]:
-    snap = user_doc(uid).get()
-    return snap.to_dict() if snap.exists else None
 
-def save_user(uid: int, data: dict):
-    user_doc(uid).set(data, merge=True)
-
-def is_registered(uid: int) -> bool:
-    u = get_user(uid)
+async def is_registered(uid: int) -> bool:
+    u = await get_user(uid)
     return bool(u and u.get("registered") is True)
 
 
-def try_dedup_lock_global(text: str) -> Tuple[bool, str]:
-    th = text_hash_norm(text)
+async def try_dedup_lock(kind: str, text: str) -> Tuple[bool, str]:
+    base = text_hash_norm(text)
+    th = f"{kind}_{base}" if kind != "cargo" else base
     now_ts = time.time()
 
     exp = RAM_DEDUP.get(th)
@@ -569,49 +546,29 @@ def try_dedup_lock_global(text: str) -> Tuple[bool, str]:
         return False, th
     RAM_DEDUP[th] = now_ts + RAM_DEDUP_TTL
 
-    try:
-        dedup_col().document(th).create({
-            "hash": th,
-            "createdAt": now_utc(),
-            "expiresAt": now_utc() + timedelta(hours=DEDUP_TTL_HOURS),
-        })
-        return True, th
-    except AlreadyExists:
-        return False, th
-    except Exception:
-        log.exception("dedup firestore error")
-        return True, th
-
-def try_truck_dedup_lock(text: str) -> Tuple[bool, str]:
-    th = "truck_" + text_hash_norm(text)
-    now_ts = time.time()
-
-    exp = RAM_DEDUP.get(th)
-    if exp and exp > now_ts:
-        return False, th
-    RAM_DEDUP[th] = now_ts + RAM_DEDUP_TTL
-
-    try:
-        truck_dedup_col().document(th).create({
-            "hash": th,
-            "createdAt": now_utc(),
-            "expiresAt": now_utc() + timedelta(hours=DEDUP_TTL_HOURS),
-        })
-        return True, th
-    except AlreadyExists:
-        return False, th
-    except Exception:
-        log.exception("truck dedup firestore error")
-        return True, th
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        inserted = await conn.fetchval(
+            """
+            insert into dedup_hashes(hash, kind, expires_at)
+            values($1, $2, $3)
+            on conflict (hash) do nothing
+            returning hash
+            """,
+            th,
+            kind,
+            now_utc() + timedelta(hours=DEDUP_TTL_HOURS),
+        )
+    return bool(inserted), th
 
 
-def save_ad_and_index_global(
+async def save_ad_and_index_global(
     chat_id: int,
     message_id: int,
     chat_title: str,
     chat_username: Optional[str],
     text: str,
-    msg_date_utc: datetime
+    msg_date_utc: datetime,
 ):
     if not looks_like_cargo_ad(text):
         return False, "filtered"
@@ -619,7 +576,7 @@ def save_ad_and_index_global(
     created_at = msg_date_utc if msg_date_utc.tzinfo else msg_date_utc.replace(tzinfo=timezone.utc)
     expires_at = created_at + timedelta(days=AD_TTL_DAYS)
 
-    is_new, ad_id = try_dedup_lock_global(text)
+    is_new, ad_id = await try_dedup_lock("cargo", text)
     if not is_new:
         return False, "dup"
 
@@ -627,53 +584,59 @@ def save_ad_and_index_global(
     places = extract_place_candidates(text)
     link = make_message_link(chat_id, message_id, chat_username)
 
-    data = {
-        "adId": ad_id,
-        "text": shorten_text(text, 170),
-        "textNorm": normalize_text(text).lower(),
-        "fromPlace": from_place,
-        "toPlace": to_place,
-        "places": places,
-        "cargoName": parse_cargo_name(text),
-        "vehicleNeed": parse_vehicle_need(text),
-        "phone": parse_phone(text),
-        "weight": parse_weight(text),
-        "link": link,
-        "sourceTitle": chat_title,
-        "sourceUsername": chat_username,
-        "sourceChatId": chat_id,
-        "sourceMessageId": message_id,
-        "sourceKey": source_key(chat_id, message_id),
-        "active": True,
-        "createdAt": created_at,
-        "updatedAt": now_utc(),
-        "expiresAt": expires_at,
-    }
-
-    batch = db.batch()
-    batch.set(ads_col().document(ad_id), data, merge=True)
-
-    for p in places[:MAX_PLACES_TO_INDEX]:
-        batch.set(place_index_col(p).document(ad_id), data, merge=True)
-
-    batch.set(source_map_col().document(source_key(chat_id, message_id)), {
-        "adId": ad_id,
-        "places": places[:MAX_PLACES_TO_INDEX],
-        "active": True,
-        "expiresAt": expires_at,
-        "updatedAt": now_utc(),
-    }, merge=True)
-
-    batch.commit()
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            insert into cargo_ads (
+                ad_id, source_chat_id, source_message_id, source_key,
+                source_title, source_username,
+                text_full, text_short, text_norm,
+                from_place, to_place, places,
+                cargo_name, vehicle_need, phone, weight,
+                link, active, created_at, updated_at, expires_at
+            )
+            values (
+                $1, $2, $3, $4,
+                $5, $6,
+                $7, $8, $9,
+                $10, $11, $12,
+                $13, $14, $15, $16,
+                $17, true, $18, $19, $20
+            )
+            on conflict (ad_id) do nothing
+            """,
+            ad_id,
+            chat_id,
+            message_id,
+            source_key(chat_id, message_id),
+            chat_title,
+            chat_username,
+            text,
+            shorten_text(text, 170),
+            normalize_text(text).lower(),
+            from_place,
+            to_place,
+            places[:MAX_PLACES_TO_INDEX],
+            parse_cargo_name(text),
+            parse_vehicle_need(text),
+            parse_phone(text),
+            parse_weight(text),
+            link,
+            created_at,
+            now_utc(),
+            expires_at,
+        )
     return True, "saved"
 
-def save_truck_and_index_global(
+
+async def save_truck_and_index_global(
     chat_id: int,
     message_id: int,
     chat_title: str,
     chat_username: Optional[str],
     text: str,
-    msg_date_utc: datetime
+    msg_date_utc: datetime,
 ):
     if not looks_like_truck_ad(text):
         return False, "filtered"
@@ -681,7 +644,7 @@ def save_truck_and_index_global(
     created_at = msg_date_utc if msg_date_utc.tzinfo else msg_date_utc.replace(tzinfo=timezone.utc)
     expires_at = created_at + timedelta(days=AD_TTL_DAYS)
 
-    is_new, th = try_truck_dedup_lock(text)
+    is_new, ad_id = await try_dedup_lock("truck", text)
     if not is_new:
         return False, "dup"
 
@@ -691,242 +654,206 @@ def save_truck_and_index_global(
     country_id, country_label, region_id, region_label = detect_truck_country_region(text)
     link = make_message_link(chat_id, message_id, chat_username)
 
-    data = {
-        "adId": th,
-        "text": shorten_preview(text, 160),
-        "textNorm": normalize_text(text).lower(),
-        "vehicle": vehicle,
-        "phone": phone,
-        "weight": weight,
-        "country": country_id,
-        "countryLabel": country_label,
-        "region": region_id,
-        "regionLabel": region_label,
-        "link": link,
-        "sourceTitle": chat_title,
-        "sourceUsername": chat_username,
-        "sourceChatId": chat_id,
-        "sourceMessageId": message_id,
-        "sourceKey": source_key(chat_id, message_id),
-        "active": True,
-        "createdAt": created_at,
-        "updatedAt": now_utc(),
-        "expiresAt": expires_at,
-    }
-
-    batch = db.batch()
-    batch.set(truck_ads_col().document(th), data, merge=True)
-    batch.set(truck_country_index_col(country_id).document(th), data, merge=True)
-
-    if region_id:
-        batch.set(truck_region_index_col(country_id, region_id).document(th), data, merge=True)
-
-    batch.set(truck_source_map_col().document(source_key(chat_id, message_id)), {
-        "adId": th,
-        "country": country_id,
-        "region": region_id,
-        "active": True,
-        "expiresAt": expires_at,
-        "updatedAt": now_utc(),
-    }, merge=True)
-
-    batch.set(truck_summary_ref(), {
-        "total": firestore.Increment(1),
-        "updatedAt": now_utc(),
-    }, merge=True)
-
-    batch.set(truck_country_stats_ref(country_id), {
-        "count": firestore.Increment(1),
-        "label": country_label,
-        "updatedAt": now_utc(),
-    }, merge=True)
-
-    if region_id:
-        batch.set(truck_region_stats_ref(country_id, region_id), {
-            "count": firestore.Increment(1),
-            "label": region_label,
-            "updatedAt": now_utc(),
-        }, merge=True)
-
-    batch.commit()
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            insert into truck_ads (
+                ad_id, source_chat_id, source_message_id, source_key,
+                source_title, source_username,
+                text_full, text_short, text_norm,
+                vehicle, phone, weight,
+                country, country_label, region, region_label,
+                link, active, created_at, updated_at, expires_at
+            )
+            values (
+                $1, $2, $3, $4,
+                $5, $6,
+                $7, $8, $9,
+                $10, $11, $12,
+                $13, $14, $15, $16,
+                $17, true, $18, $19, $20
+            )
+            on conflict (ad_id) do nothing
+            """,
+            ad_id,
+            chat_id,
+            message_id,
+            source_key(chat_id, message_id),
+            chat_title,
+            chat_username,
+            text,
+            shorten_preview(text, 160),
+            normalize_text(text).lower(),
+            vehicle,
+            phone,
+            weight,
+            country_id,
+            country_label,
+            region_id,
+            region_label,
+            link,
+            created_at,
+            now_utc(),
+            expires_at,
+        )
     return True, "saved"
 
-def deactivate_by_source(chat_id: int, message_id: int) -> bool:
-    sm_ref = source_map_col().document(source_key(chat_id, message_id))
-    snap = sm_ref.get()
-    if not snap.exists:
-        return False
 
-    data = snap.to_dict() or {}
-    ad_id = data.get("adId")
-    places = data.get("places") or []
-    if not ad_id:
-        return False
-
-    batch = db.batch()
-    ts = now_utc()
-
-    batch.set(ads_col().document(ad_id), {"active": False, "updatedAt": ts}, merge=True)
-    for p in places[:MAX_PLACES_TO_INDEX]:
-        batch.set(place_index_col(p).document(ad_id), {"active": False, "updatedAt": ts}, merge=True)
-    batch.set(sm_ref, {"active": False, "updatedAt": ts}, merge=True)
-    batch.commit()
-    return True
-
-def deactivate_truck_by_source(chat_id: int, message_id: int) -> bool:
-    sm_ref = truck_source_map_col().document(source_key(chat_id, message_id))
-    snap = sm_ref.get()
-    if not snap.exists:
-        return False
-
-    data = snap.to_dict() or {}
-    if data.get("active") is False:
-        return False
-
-    ad_id = data.get("adId")
-    country = data.get("country")
-    region = data.get("region")
-    if not ad_id or not country:
-        return False
-
-    now_dt = now_utc()
-    batch = db.batch()
-
-    batch.set(truck_ads_col().document(ad_id), {
-        "active": False,
-        "updatedAt": now_dt
-    }, merge=True)
-
-    batch.set(truck_country_index_col(country).document(ad_id), {
-        "active": False,
-        "updatedAt": now_dt
-    }, merge=True)
-
-    if region:
-        batch.set(truck_region_index_col(country, region).document(ad_id), {
-            "active": False,
-            "updatedAt": now_dt
-        }, merge=True)
-
-    batch.set(sm_ref, {
-        "active": False,
-        "updatedAt": now_dt
-    }, merge=True)
-
-    batch.set(truck_summary_ref(), {
-        "total": firestore.Increment(-1),
-        "updatedAt": now_dt
-    }, merge=True)
-
-    batch.set(truck_country_stats_ref(country), {
-        "count": firestore.Increment(-1),
-        "updatedAt": now_dt
-    }, merge=True)
-
-    if region:
-        batch.set(truck_region_stats_ref(country, region), {
-            "count": firestore.Increment(-1),
-            "updatedAt": now_dt
-        }, merge=True)
-
-    batch.commit()
-    return True
+async def deactivate_by_source(chat_id: int, message_id: int) -> int:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        res1 = await conn.execute(
+            """
+            update cargo_ads
+            set active = false, updated_at = $3
+            where source_chat_id = $1 and source_message_id = $2 and active = true
+            """,
+            chat_id,
+            message_id,
+            now_utc(),
+        )
+        res2 = await conn.execute(
+            """
+            update truck_ads
+            set active = false, updated_at = $3
+            where source_chat_id = $1 and source_message_id = $2 and active = true
+            """,
+            chat_id,
+            message_id,
+            now_utc(),
+        )
+    return int(res1.split()[-1]) + int(res2.split()[-1])
 
 
-def query_place_index_page(place1: str, place2: Optional[str], cursor: Optional[Tuple[datetime, str]]):
-    col = place_index_col(place1)
-
-    q = (
-        col.where("active", "==", True)
-        .order_by("createdAt", direction=firestore.Query.DESCENDING)
-        .order_by("__name__", direction=firestore.Query.DESCENDING)
-    )
+async def query_cargo_page(
+    place1: str,
+    place2: Optional[str],
+    cursor: Optional[Tuple[datetime, str]],
+):
+    pool = get_pool()
+    conditions = [
+        "active = true",
+        "(from_place = $1 or to_place = $1 or $1 = any(places))",
+    ]
+    params: List[Any] = [place1]
+    idx = 2
 
     if place2:
-        q = q.where("places", "array_contains", place2)
+        conditions.append("(from_place = $2 or to_place = $2 or $2 = any(places))")
+        params.append(place2)
+        idx = 3
 
     if cursor:
-        q = q.start_after([cursor[0], col.document(cursor[1])])
+        conditions.append(f"(created_at, ad_id) < (${idx}, ${idx + 1})")
+        params.extend([cursor[0], cursor[1]])
+        idx += 2
 
-    docs = list(q.limit(PAGE_SIZE + 1).stream())
-    has_next = len(docs) > PAGE_SIZE
-    docs = docs[:PAGE_SIZE]
+    where_sql = " and ".join(conditions)
+    sql = f"""
+        select
+            ad_id, text_short as text, text_norm,
+            from_place, to_place, places,
+            cargo_name, vehicle_need, phone, weight, link,
+            source_title, source_username,
+            source_chat_id, source_message_id,
+            active, created_at, updated_at, expires_at
+        from cargo_ads
+        where {where_sql}
+        order by created_at desc, ad_id desc
+        limit {PAGE_SIZE + 1}
+    """
 
-    items = []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    items = [dict(r) for r in rows]
+
     next_cursor = None
-    for d in docs:
-        item = d.to_dict() or {}
-        item["_id"] = d.id
-        items.append(item)
-
-    if docs:
-        last = docs[-1]
-        ld = last.to_dict() or {}
-        if isinstance(ld.get("createdAt"), datetime):
-            next_cursor = (ld["createdAt"], last.id)
+    if rows:
+        last = rows[-1]
+        next_cursor = (last["created_at"], last["ad_id"])
 
     return items, next_cursor, has_next
 
-def fallback_scan_ads(place1: str, place2: Optional[str], offset: int = 0):
+
+async def fallback_scan_ads(place1: str, place2: Optional[str], offset: int = 0):
     p1 = normalize_place_token(place1)
     p2 = normalize_place_token(place2) if place2 else None
 
-    docs = list(
-        ads_col()
-        .where("active", "==", True)
-        .order_by("createdAt", direction=firestore.Query.DESCENDING)
-        .limit(FALLBACK_SCAN_LIMIT)
-        .stream()
-    )
+    pool = get_pool()
+    conditions = ["active = true", "text_norm like $1"]
+    params: List[Any] = [f"%{p1}%"]
 
-    matched = []
-    for d in docs:
-        x = d.to_dict() or {}
-        txt = x.get("textNorm") or ""
-        if p1 and p1 not in txt:
-            continue
-        if p2 and p2 not in txt:
-            continue
-        x["_id"] = d.id
-        matched.append(x)
+    if p2:
+        conditions.append("text_norm like $2")
+        params.append(f"%{p2}%")
 
-    total = len(matched)
-    page_items = matched[offset: offset + PAGE_SIZE]
+    where_sql = " and ".join(conditions)
+
+    sql = f"""
+        select
+            ad_id, text_short as text, text_norm,
+            from_place, to_place, places,
+            cargo_name, vehicle_need, phone, weight, link,
+            source_title, source_username,
+            source_chat_id, source_message_id,
+            active, created_at, updated_at, expires_at
+        from cargo_ads
+        where {where_sql}
+        order by created_at desc, ad_id desc
+        offset {offset}
+        limit {PAGE_SIZE + 1}
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    items = [dict(r) for r in rows]
     next_offset = offset + PAGE_SIZE
-    return page_items, next_offset, next_offset < total
+    return items, next_offset, has_next
 
 
 class Register(StatesGroup):
     waiting_contact = State()
     waiting_fullname = State()
 
+
 class CargoSearch(StatesGroup):
     waiting_place = State()
+
 
 def kb_request_contact() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📱 Kontakt ulashish", request_contact=True)],
-            [KeyboardButton(text="❌ Bekor qilish")]
+            [KeyboardButton(text="❌ Bekor qilish")],
         ],
         resize_keyboard=True,
-        one_time_keyboard=True
+        one_time_keyboard=True,
     )
+
 
 def kb_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📦 Yuk e'lonlari")],
-            [KeyboardButton(text="🚚 Yuk mashinalar e'lonlari")]
+            [KeyboardButton(text="🚚 Yuk mashinalar e'lonlari")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
+
 
 def kb_cancel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
+
 
 def build_page_keyboard(session_id: str, page: int, has_prev: bool, has_next: bool):
     row = []
@@ -936,9 +863,10 @@ def build_page_keyboard(session_id: str, page: int, has_prev: bool, has_next: bo
         row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"cargo_nav:{session_id}:{page+1}"))
     return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
 
+
 def short_route(ad: dict) -> str:
-    if ad.get("fromPlace") and ad.get("toPlace"):
-        return f"{ad['fromPlace']} → {ad['toPlace']}"
+    if ad.get("from_place") and ad.get("to_place"):
+        return f"{ad['from_place']} → {ad['to_place']}"
     places = ad.get("places") or []
     if len(places) >= 2:
         return f"{places[0]} → {places[1]}"
@@ -946,10 +874,11 @@ def short_route(ad: dict) -> str:
         return places[0]
     return "—"
 
+
 def format_ad_item(ad: dict, idx: int) -> str:
     route = short_route(ad)
-    cargo = ad.get("cargoName") or "Aniqlanmadi"
-    vehicle = ad.get("vehicleNeed") or "Ko‘rsatilmagan"
+    cargo = ad.get("cargo_name") or "Aniqlanmadi"
+    vehicle = ad.get("vehicle_need") or "Ko‘rsatilmagan"
     phone = ad.get("phone") or "Ko‘rsatilmagan"
     weight = ad.get("weight") or "—"
     text = ad.get("text") or ""
@@ -966,13 +895,14 @@ def format_ad_item(ad: dict, idx: int) -> str:
         f"🔗 {details}"
     )
 
+
 def build_page_text(items: List[dict], place1: str, place2: Optional[str], page: int) -> str:
     query_text = f"{place1} + {place2}" if place2 else place1
     lines = [
         "📦 <b>Topilgan e’lonlar</b>",
         f"🔎 <b>So‘rov:</b> {escape_html(query_text)}",
         f"📄 <b>Sahifa:</b> {page + 1}",
-        ""
+        "",
     ]
     for i, ad in enumerate(items, start=1):
         lines.append(format_ad_item(ad, i))
@@ -987,12 +917,12 @@ def build_page_text(items: List[dict], place1: str, place2: Optional[str], page:
         "📦 <b>Topilgan e’lonlar</b>",
         f"🔎 <b>So‘rov:</b> {escape_html(query_text)}",
         f"📄 <b>Sahifa:</b> {page + 1}",
-        ""
+        "",
     ]
     for i, ad in enumerate(items, start=1):
         route = short_route(ad)
-        cargo = ad.get("cargoName") or "Aniqlanmadi"
-        vehicle = ad.get("vehicleNeed") or "—"
+        cargo = ad.get("cargo_name") or "Aniqlanmadi"
+        vehicle = ad.get("vehicle_need") or "—"
         phone = ad.get("phone") or "—"
         link = ad.get("link")
         details = f'<a href="{link}">Batafsil</a>' if link else "Batafsil yo‘q"
@@ -1002,6 +932,7 @@ def build_page_text(items: List[dict], place1: str, place2: Optional[str], page:
         )
     return "\n".join(short_lines)
 
+
 async def delete_session_messages(bot: Bot, chat_id: int, session_id: str):
     sess = SEARCH_SESSIONS.get(session_id)
     if not sess:
@@ -1009,11 +940,13 @@ async def delete_session_messages(bot: Bot, chat_id: int, session_id: str):
     mids = sess.get("sent_msg_ids") or []
     if not mids:
         return
-    await asyncio.gather(*[
-        bot.delete_message(chat_id, mid) for mid in mids
-    ], return_exceptions=True)
+    await asyncio.gather(
+        *[bot.delete_message(chat_id, mid) for mid in mids],
+        return_exceptions=True,
+    )
     sess["sent_msg_ids"] = []
     SEARCH_SESSIONS[session_id] = sess
+
 
 async def send_page(bot: Bot, chat_id: int, session_id: str, page: int):
     sess = SEARCH_SESSIONS.get(session_id)
@@ -1032,12 +965,18 @@ async def send_page(bot: Bot, chat_id: int, session_id: str, page: int):
             cursors.append(None)
         cursor = cursors[page]
 
-        key = ("idx", place1, place2 or "-", cursor[0].isoformat() if cursor else "-", cursor[1] if cursor else "-")
+        key = (
+            "idx",
+            place1,
+            place2 or "-",
+            cursor[0].isoformat() if cursor else "-",
+            cursor[1] if cursor else "-",
+        )
         cached = cache_get(key)
         if cached:
             items, next_cursor, has_next = cached
         else:
-            items, next_cursor, has_next = query_place_index_page(place1, place2, cursor)
+            items, next_cursor, has_next = await query_cargo_page(place1, place2, cursor)
             cache_set(key, items, next_cursor, has_next)
 
         if not items:
@@ -1056,7 +995,7 @@ async def send_page(bot: Bot, chat_id: int, session_id: str, page: int):
     else:
         offsets = sess.setdefault("fb_offsets", {0: 0})
         offset = offsets.get(page, 0)
-        items, next_offset, has_next = fallback_scan_ads(place1, place2, offset)
+        items, next_offset, has_next = await fallback_scan_ads(place1, place2, offset)
         offsets[page + 1] = next_offset
         SEARCH_SESSIONS[session_id] = sess
 
@@ -1070,7 +1009,7 @@ async def send_page(bot: Bot, chat_id: int, session_id: str, page: int):
         build_page_text(items, place1, place2, page),
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=build_page_keyboard(session_id, page, page > 0, has_next)
+        reply_markup=build_page_keyboard(session_id, page, page > 0, has_next),
     )
     sess["sent_msg_ids"] = [msg.message_id]
     SEARCH_SESSIONS[session_id] = sess
@@ -1078,15 +1017,19 @@ async def send_page(bot: Bot, chat_id: int, session_id: str, page: int):
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-telethon_client = TelegramClient("telethon_session", TG_API_ID, TG_API_HASH)
+telethon_client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
 
-register_truck_module(dp, bot, {
-    "db": db,
-    "is_registered": is_registered,
-    "kb_main_menu": kb_main_menu,
-    "escape_html": escape_html,
-    "make_session_id": make_session_id,
-})
+register_truck_module(
+    dp,
+    bot,
+    {
+        "get_db_pool": get_pool,
+        "is_registered": is_registered,
+        "kb_main_menu": kb_main_menu,
+        "escape_html": escape_html,
+        "make_session_id": make_session_id,
+    },
+)
 
 
 @dp.error()
@@ -1108,18 +1051,23 @@ async def start(message: types.Message, state: FSMContext):
         return
 
     uid = message.from_user.id
-    if is_registered(uid):
+    if await is_registered(uid):
         await state.clear()
         await message.answer("✅ Menyu:", reply_markup=kb_main_menu())
         return
 
     await state.set_state(Register.waiting_contact)
-    await message.answer("Assalomu alaykum!\n\n📱 Davom etish uchun kontaktingizni ulashing.", reply_markup=kb_request_contact())
+    await message.answer(
+        "Assalomu alaykum!\n\n📱 Davom etish uchun kontaktingizni ulashing.",
+        reply_markup=kb_request_contact(),
+    )
+
 
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Bekor qilindi. /start ni bosing.", reply_markup=types.ReplyKeyboardRemove())
+
 
 @dp.message(Register.waiting_contact, F.contact)
 async def got_contact(message: types.Message, state: FSMContext):
@@ -1128,22 +1076,27 @@ async def got_contact(message: types.Message, state: FSMContext):
         await message.answer("O‘zingizning kontaktingizni yuboring.")
         return
 
-    save_user(uid, {
-        "phone": message.contact.phone_number,
-        "tgUsername": message.from_user.username,
-        "registered": False,
-        "updatedAt": now_utc(),
-    })
+    await save_user(
+        uid,
+        {
+            "phone": message.contact.phone_number,
+            "tgUsername": message.from_user.username,
+            "registered": False,
+            "updatedAt": now_utc(),
+        },
+    )
     await state.set_state(Register.waiting_fullname)
     await message.answer(
         "Ism familiyangizni kiriting.\nMasalan: <b>Ali Valiyev</b>",
         parse_mode="HTML",
-        reply_markup=types.ReplyKeyboardRemove()
+        reply_markup=types.ReplyKeyboardRemove(),
     )
+
 
 @dp.message(Register.waiting_contact)
 async def contact_required(message: types.Message):
     await message.answer("📱 Kontakt ulashish tugmasini bosing.", reply_markup=kb_request_contact())
+
 
 @dp.message(Register.waiting_fullname, F.text)
 async def got_fullname(message: types.Message, state: FSMContext):
@@ -1152,20 +1105,24 @@ async def got_fullname(message: types.Message, state: FSMContext):
         await message.answer("Ism va familiyani to‘liq kiriting. Masalan: Ali Valiyev")
         return
 
-    save_user(message.from_user.id, {
-        "fullname": fullname,
-        "registered": True,
-        "createdAt": firestore.SERVER_TIMESTAMP,
-        "updatedAt": now_utc(),
-    })
+    await save_user(
+        message.from_user.id,
+        {
+            "fullname": fullname,
+            "registered": True,
+            "createdAt": now_utc(),
+            "updatedAt": now_utc(),
+        },
+    )
     await state.clear()
     await message.answer("✅ Ro‘yxatdan o‘tdingiz!\nMenyu:", reply_markup=kb_main_menu())
+
 
 @dp.message(F.text == "📦 Yuk e'lonlari")
 async def cargo_menu(message: types.Message, state: FSMContext):
     if message.chat.type != "private":
         return
-    if not is_registered(message.from_user.id):
+    if not await is_registered(message.from_user.id):
         await message.answer("Avval /start orqali ro‘yxatdan o‘ting.")
         return
 
@@ -1174,10 +1131,11 @@ async def cargo_menu(message: types.Message, state: FSMContext):
         "🏙 <b>Joy nomini kiriting</b>\n\n"
         "1 ta joy: <i>Buxoro</i>\n"
         "2 ta joy: <i>Buxoro Moskva</i>\n\n"
-        "Bot avval indexdan qidiradi, topilmasa oxirgi e’lonlar ichidan qidiradi.",
+        "Bot avval aniq filter bo‘yicha qidiradi, topilmasa oxirgi e’lonlar ichidan qidiradi.",
         parse_mode="HTML",
-        reply_markup=kb_cancel()
+        reply_markup=kb_cancel(),
     )
+
 
 @dp.message(CargoSearch.waiting_place, F.text)
 async def cargo_place_entered(message: types.Message, state: FSMContext):
@@ -1210,6 +1168,7 @@ async def cargo_place_entered(message: types.Message, state: FSMContext):
         "fb_offsets": {0: 0},
     }
     await send_page(bot, message.chat.id, sid, 0)
+
 
 @dp.callback_query(F.data.startswith("cargo_nav:"))
 async def cargo_nav(callback: types.CallbackQuery):
@@ -1248,12 +1207,14 @@ async def get_chat_info_cached(chat_id: int) -> Tuple[str, Optional[str]]:
     CHAT_CACHE[chat_id] = (title, username, now_ts + CHAT_CACHE_TTL)
     return title, username
 
+
 @telethon_client.on(events.NewMessage)
 async def on_new_message(event: events.NewMessage.Event):
     try:
         msg = event.message
         if not msg or not msg.message:
             return
+
         text = msg.message
         if not (looks_like_cargo_ad(text) or looks_like_truck_ad(text)):
             return
@@ -1264,42 +1225,33 @@ async def on_new_message(event: events.NewMessage.Event):
         if msg_date.tzinfo is None:
             msg_date = msg_date.replace(tzinfo=timezone.utc)
 
-        INGEST_QUEUE.put_nowait({
-            "chat_id": event.chat_id,
-            "message_id": msg.id,
-            "text": text,
-            "msg_date": msg_date,
-        })
+        INGEST_QUEUE.put_nowait(
+            {
+                "chat_id": event.chat_id,
+                "message_id": msg.id,
+                "text": text,
+                "msg_date": msg_date,
+            }
+        )
     except asyncio.QueueFull:
         log.warning("INGEST_QUEUE full")
     except Exception:
         log.exception("TELETHON NewMessage error")
+
 
 @telethon_client.on(events.MessageDeleted)
 async def on_deleted(event: events.MessageDeleted.Event):
     try:
         if not getattr(event, "chat_id", None):
             return
-        loop = asyncio.get_running_loop()
-        mids = list(event.deleted_ids)
 
-        def _job():
-            changed = 0
-            for mid in mids:
-                try:
-                    if deactivate_by_source(event.chat_id, mid):
-                        changed += 1
-                except Exception:
-                    log.exception("cargo deactivate error")
+        changed = 0
+        for mid in list(event.deleted_ids):
+            try:
+                changed += await deactivate_by_source(event.chat_id, mid)
+            except Exception:
+                log.exception("deactivate_by_source error")
 
-                try:
-                    if deactivate_truck_by_source(event.chat_id, mid):
-                        changed += 1
-                except Exception:
-                    log.exception("truck deactivate error")
-            return changed
-
-        changed = await loop.run_in_executor(FS_EXECUTOR, _job)
         if changed:
             log.info("deleted updated=%s", changed)
     except Exception:
@@ -1314,46 +1266,45 @@ async def ingest_worker(worker_id: int):
         if not buf:
             return
 
-        def _write(items):
-            cargo_saved = 0
-            truck_saved = 0
+        cargo_saved = 0
+        truck_saved = 0
 
-            for it in items:
-                try:
-                    ok, _ = save_ad_and_index_global(
-                        chat_id=it["chat_id"],
-                        message_id=it["message_id"],
-                        chat_title=it["chat_title"],
-                        chat_username=it["chat_username"],
-                        text=it["text"],
-                        msg_date_utc=it["msg_date"],
-                    )
-                    if ok:
-                        cargo_saved += 1
-                except Exception:
-                    log.exception("save cargo error")
+        for it in buf:
+            try:
+                ok, _ = await save_ad_and_index_global(
+                    chat_id=it["chat_id"],
+                    message_id=it["message_id"],
+                    chat_title=it["chat_title"],
+                    chat_username=it["chat_username"],
+                    text=it["text"],
+                    msg_date_utc=it["msg_date"],
+                )
+                if ok:
+                    cargo_saved += 1
+            except Exception:
+                log.exception("save cargo error")
 
-                try:
-                    ok2, _ = save_truck_and_index_global(
-                        chat_id=it["chat_id"],
-                        message_id=it["message_id"],
-                        chat_title=it["chat_title"],
-                        chat_username=it["chat_username"],
-                        text=it["text"],
-                        msg_date_utc=it["msg_date"],
-                    )
-                    if ok2:
-                        truck_saved += 1
-                except Exception:
-                    log.exception("save truck error")
+            try:
+                ok2, _ = await save_truck_and_index_global(
+                    chat_id=it["chat_id"],
+                    message_id=it["message_id"],
+                    chat_title=it["chat_title"],
+                    chat_username=it["chat_username"],
+                    text=it["text"],
+                    msg_date_utc=it["msg_date"],
+                )
+                if ok2:
+                    truck_saved += 1
+            except Exception:
+                log.exception("save truck error")
 
-            return cargo_saved, truck_saved
-
-        loop = asyncio.get_running_loop()
-        cargo_saved, truck_saved = await loop.run_in_executor(FS_EXECUTOR, _write, list(buf))
         log.info(
             "worker[%s] flushed=%s cargo_new=%s truck_new=%s queue=%s",
-            worker_id, len(buf), cargo_saved, truck_saved, INGEST_QUEUE.qsize()
+            worker_id,
+            len(buf),
+            cargo_saved,
+            truck_saved,
+            INGEST_QUEUE.qsize(),
         )
 
     while True:
@@ -1381,119 +1332,62 @@ async def ingest_worker(worker_id: int):
                 it2["chat_username"] = username2
                 buffer.append(it2)
                 INGEST_QUEUE.task_done()
+
         except Exception:
             log.exception("ingest_worker error")
             await asyncio.sleep(1)
 
+
 async def expire_sweeper():
     while True:
         try:
-            now_dt = now_utc()
-            loop = asyncio.get_running_loop()
-
-            def _expire_ads():
-                docs = list(
-                    ads_col()
-                    .where("active", "==", True)
-                    .where("expiresAt", "<=", now_dt)
-                    .order_by("expiresAt")
-                    .limit(200)
-                    .stream()
+            pool = get_pool()
+            async with pool.acquire() as conn:
+                cargo_cnt = await conn.fetchval(
+                    """
+                    with t as (
+                        update cargo_ads
+                        set active = false, updated_at = now()
+                        where active = true and expires_at <= now()
+                        returning 1
+                    )
+                    select count(*) from t
+                    """
                 )
-                if not docs:
-                    return 0
-                batch = db.batch()
-                for d in docs:
-                    x = d.to_dict() or {}
-                    batch.set(d.reference, {"active": False, "updatedAt": now_dt}, merge=True)
-                    for p in (x.get("places") or [])[:MAX_PLACES_TO_INDEX]:
-                        batch.set(place_index_col(p).document(d.id), {"active": False, "updatedAt": now_dt}, merge=True)
-                batch.commit()
-                return len(docs)
-
-            def _expire_trucks_once():
-                q = (
-                    truck_ads_col()
-                    .where("active", "==", True)
-                    .where("expiresAt", "<=", now_dt)
-                    .order_by("expiresAt")
-                    .limit(200)
+                truck_cnt = await conn.fetchval(
+                    """
+                    with t as (
+                        update truck_ads
+                        set active = false, updated_at = now()
+                        where active = true and expires_at <= now()
+                        returning 1
+                    )
+                    select count(*) from t
+                    """
                 )
-                docs = list(q.stream())
-                if not docs:
-                    return 0
+                dedup_cnt = await conn.fetchval(
+                    """
+                    with t as (
+                        delete from dedup_hashes
+                        where expires_at <= now()
+                        returning 1
+                    )
+                    select count(*) from t
+                    """
+                )
 
-                batch = db.batch()
-                for d in docs:
-                    data = d.to_dict() or {}
-                    country = data.get("country")
-                    region = data.get("region")
-
-                    batch.set(d.reference, {"active": False, "updatedAt": now_dt}, merge=True)
-
-                    if country:
-                        batch.set(truck_country_index_col(country).document(d.id), {
-                            "active": False,
-                            "updatedAt": now_dt
-                        }, merge=True)
-
-                        batch.set(truck_country_stats_ref(country), {
-                            "count": firestore.Increment(-1),
-                            "updatedAt": now_dt
-                        }, merge=True)
-
-                    if country and region:
-                        batch.set(truck_region_index_col(country, region).document(d.id), {
-                            "active": False,
-                            "updatedAt": now_dt
-                        }, merge=True)
-
-                        batch.set(truck_region_stats_ref(country, region), {
-                            "count": firestore.Increment(-1),
-                            "updatedAt": now_dt
-                        }, merge=True)
-
-                    batch.set(truck_summary_ref(), {
-                        "total": firestore.Increment(-1),
-                        "updatedAt": now_dt
-                    }, merge=True)
-
-                    skey = data.get("sourceKey")
-                    if skey:
-                        batch.set(truck_source_map_col().document(skey), {
-                            "active": False,
-                            "updatedAt": now_dt
-                        }, merge=True)
-
-                batch.commit()
-                return len(docs)
-
-            def _cleanup(col_ref, limit=300):
-                docs = list(col_ref.where("expiresAt", "<=", now_dt).order_by("expiresAt").limit(limit).stream())
-                if not docs:
-                    return 0
-                batch = db.batch()
-                for d in docs:
-                    batch.delete(d.reference)
-                batch.commit()
-                return len(docs)
-
-            ads_cnt = await loop.run_in_executor(FS_EXECUTOR, _expire_ads)
-            truck_ads_cnt = await loop.run_in_executor(FS_EXECUTOR, _expire_trucks_once)
-            dedup_cnt = await loop.run_in_executor(FS_EXECUTOR, lambda: _cleanup(dedup_col()))
-            src_cnt = await loop.run_in_executor(FS_EXECUTOR, lambda: _cleanup(source_map_col()))
-            truck_dedup_cnt = await loop.run_in_executor(FS_EXECUTOR, lambda: _cleanup(truck_dedup_col()))
-            truck_src_cnt = await loop.run_in_executor(FS_EXECUTOR, lambda: _cleanup(truck_source_map_col()))
-
-            if ads_cnt or truck_ads_cnt or dedup_cnt or src_cnt or truck_dedup_cnt or truck_src_cnt:
+            if cargo_cnt or truck_cnt or dedup_cnt:
                 log.info(
-                    "cleanup cargo_ads=%s truck_ads=%s dedup=%s source=%s truck_dedup=%s truck_source=%s",
-                    ads_cnt, truck_ads_cnt, dedup_cnt, src_cnt, truck_dedup_cnt, truck_src_cnt
+                    "cleanup cargo_ads=%s truck_ads=%s dedup=%s",
+                    cargo_cnt,
+                    truck_cnt,
+                    dedup_cnt,
                 )
         except Exception:
             log.exception("expire_sweeper error")
 
         await asyncio.sleep(EXPIRE_SWEEP_EVERY)
+
 
 async def gc_task():
     while True:
@@ -1519,27 +1413,59 @@ async def gc_task():
 
 
 async def run_bot():
-    await bot.delete_webhook(drop_pending_updates=True)
-    me = await bot.get_me()
-    log.info("Bot started @%s", me.username)
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            me = await bot.get_me()
+            log.info("Bot started @%s", me.username)
+            await dp.start_polling(bot)
+        except Exception:
+            log.exception("run_bot error")
+            await asyncio.sleep(5)
 
-async def run_telethon():
-    log.info("Telethon starting...")
-    await telethon_client.start(phone=TG_PHONE)
-    me = await telethon_client.get_me()
-    log.info("Telethon connected @%s", getattr(me, "username", None))
-    await telethon_client.run_until_disconnected()
+
+async def run_telethon_forever():
+    while True:
+        try:
+            log.info("Telethon starting...")
+            await telethon_client.connect()
+
+            if not await telethon_client.is_user_authorized():
+                raise RuntimeError("TG_SESSION noto'g'ri yoki authorize qilinmagan. Yangi StringSession yarating.")
+
+            me = await telethon_client.get_me()
+            log.info("Telethon connected @%s", getattr(me, "username", None))
+            await telethon_client.run_until_disconnected()
+
+        except FloodWaitError as e:
+            wait_sec = int(getattr(e, "seconds", 60))
+            log.warning("Telethon FloodWait: %s sec", wait_sec)
+            await asyncio.sleep(wait_sec + 5)
+
+        except SessionPasswordNeededError:
+            log.error("Telegram akkauntda 2FA yoqilgan. StringSession yaratishda parolni ham kiriting.")
+            await asyncio.sleep(60)
+
+        except Exception:
+            log.exception("run_telethon_forever error")
+            await asyncio.sleep(15)
+
 
 async def main():
-    workers = [ingest_worker(i) for i in range(1, 5)]
-    await asyncio.gather(
-        run_telethon(),
-        run_bot(),
-        expire_sweeper(),
-        gc_task(),
-        *workers,
-    )
+    await init_db()
+
+    tasks = [
+        asyncio.create_task(run_telethon_forever()),
+        asyncio.create_task(run_bot()),
+        asyncio.create_task(expire_sweeper()),
+        asyncio.create_task(gc_task()),
+    ]
+
+    for i in range(1, 5):
+        tasks.append(asyncio.create_task(ingest_worker(i)))
+
+    await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

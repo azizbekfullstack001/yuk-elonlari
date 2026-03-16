@@ -5,43 +5,23 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from aiogram import F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from firebase_admin import firestore
-
 
 PAGE_SIZE = 5
 TRUCK_CACHE_TTL = 300
 
 TRUCK_UI_SESSIONS: Dict[str, Dict[str, Any]] = {}
-TRUCK_CACHE: Dict[Tuple[str, str, str, str, str], Tuple[float, List[dict], Optional[Tuple[datetime, str]], bool]] = {}
+TRUCK_CACHE: Dict[
+    Tuple[str, str, str, str, str],
+    Tuple[float, List[dict], Optional[Tuple[datetime, str]], bool]
+] = {}
 
 
 def register_truck_module(dp, bot, deps: dict):
-    db = deps["db"]
+    get_db_pool = deps["get_db_pool"]
     is_registered = deps["is_registered"]
     kb_main_menu = deps["kb_main_menu"]
     escape_html = deps["escape_html"]
     make_session_id = deps["make_session_id"]
-
-    def truck_summary_ref():
-        return db.collection("truck_stats").document("summary")
-
-    def truck_country_stats_col():
-        return db.collection("truck_stats_countries")
-
-    def truck_region_stats_col(country: str):
-        return db.collection("truck_stats_regions").document(country).collection("regions")
-
-    def truck_country_index_col(country: str):
-        return db.collection("truck_country_index").document(country).collection("ads")
-
-    def truck_region_index_col(country: str, region: str):
-        return (
-            db.collection("truck_region_index")
-            .document(country)
-            .collection("regions")
-            .document(region)
-            .collection("ads")
-        )
 
     def cache_get(key):
         v = TRUCK_CACHE.get(key)
@@ -56,109 +36,164 @@ def register_truck_module(dp, bot, deps: dict):
     def cache_set(key, items, next_cursor, has_next):
         TRUCK_CACHE[key] = (time.time(), items, next_cursor, has_next)
 
-    def get_total_count() -> int:
-        snap = truck_summary_ref().get()
-        if not snap.exists:
-            return 0
-        return max(0, int((snap.to_dict() or {}).get("total", 0) or 0))
+    async def get_total_count() -> int:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
+            total = await conn.fetchval(
+                """
+                select count(*)
+                from truck_ads
+                where active = true
+                """
+            )
+        return int(total or 0)
 
-    def get_country_counts() -> List[dict]:
-        docs = list(
-            truck_country_stats_col()
-            .order_by("count", direction=firestore.Query.DESCENDING)
-            .limit(30)
-            .stream()
-        )
-        out = []
-        for d in docs:
-            x = d.to_dict() or {}
-            cnt = int(x.get("count", 0) or 0)
-            if cnt <= 0:
-                continue
-            out.append({
-                "id": d.id,
-                "label": x.get("label") or d.id.title(),
-                "count": cnt,
-            })
-        return out
+    async def get_country_counts() -> List[dict]:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                select
+                    country as id,
+                    max(country_label) as label,
+                    count(*) as count
+                from truck_ads
+                where active = true
+                group by country
+                having count(*) > 0
+                order by count(*) desc, max(country_label) asc
+                limit 30
+                """
+            )
 
-    def get_region_counts(country: str) -> List[dict]:
-        docs = list(
-            truck_region_stats_col(country)
-            .order_by("count", direction=firestore.Query.DESCENDING)
-            .limit(50)
-            .stream()
-        )
-        out = []
-        for d in docs:
-            x = d.to_dict() or {}
-            cnt = int(x.get("count", 0) or 0)
-            if cnt <= 0:
-                continue
-            out.append({
-                "id": d.id,
-                "label": x.get("label") or d.id.title(),
-                "count": cnt,
-            })
-        return out
+        return [
+            {
+                "id": r["id"],
+                "label": r["label"] or str(r["id"]).title(),
+                "count": int(r["count"] or 0),
+            }
+            for r in rows
+        ]
 
-    def query_country_page(country: str, cursor: Optional[Tuple[datetime, str]]):
-        col = truck_country_index_col(country)
-        q = (
-            col.where("active", "==", True)
-            .order_by("createdAt", direction=firestore.Query.DESCENDING)
-            .order_by("__name__", direction=firestore.Query.DESCENDING)
-        )
+    async def get_region_counts(country: str) -> List[dict]:
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                select
+                    region as id,
+                    max(region_label) as label,
+                    count(*) as count
+                from truck_ads
+                where active = true
+                  and country = $1
+                  and region is not null
+                group by region
+                having count(*) > 0
+                order by count(*) desc, max(region_label) asc
+                limit 50
+                """,
+                country,
+            )
+
+        return [
+            {
+                "id": r["id"],
+                "label": r["label"] or str(r["id"]).title(),
+                "count": int(r["count"] or 0),
+            }
+            for r in rows
+        ]
+
+    async def query_country_page(country: str, cursor: Optional[Tuple[datetime, str]]):
+        pool = get_db_pool()
+        params: List[Any] = [country]
+        where_sql = "active = true and country = $1"
 
         if cursor:
-            q = q.start_after([cursor[0], col.document(cursor[1])])
+            params.extend([cursor[0], cursor[1]])
+            where_sql += " and (created_at, ad_id) < ($2, $3)"
 
-        docs = list(q.limit(PAGE_SIZE + 1).stream())
-        has_next = len(docs) > PAGE_SIZE
-        docs = docs[:PAGE_SIZE]
+        sql = f"""
+            select
+                ad_id,
+                text_short as text,
+                text_norm,
+                vehicle,
+                phone,
+                weight,
+                country,
+                country_label,
+                region,
+                region_label,
+                link,
+                active,
+                created_at,
+                updated_at,
+                expires_at
+            from truck_ads
+            where {where_sql}
+            order by created_at desc, ad_id desc
+            limit {PAGE_SIZE + 1}
+        """
 
-        items, next_cursor = [], None
-        for d in docs:
-            x = d.to_dict() or {}
-            x["_id"] = d.id
-            items.append(x)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
 
-        if docs:
-            last = docs[-1]
-            ld = last.to_dict() or {}
-            created_at = ld.get("createdAt")
-            if isinstance(created_at, datetime):
-                next_cursor = (created_at, last.id)
+        has_next = len(rows) > PAGE_SIZE
+        rows = rows[:PAGE_SIZE]
+        items = [dict(r) for r in rows]
+
+        next_cursor = None
+        if rows:
+            last = rows[-1]
+            next_cursor = (last["created_at"], last["ad_id"])
 
         return items, next_cursor, has_next
 
-    def query_region_page(country: str, region: str, cursor: Optional[Tuple[datetime, str]]):
-        col = truck_region_index_col(country, region)
-        q = (
-            col.where("active", "==", True)
-            .order_by("createdAt", direction=firestore.Query.DESCENDING)
-            .order_by("__name__", direction=firestore.Query.DESCENDING)
-        )
+    async def query_region_page(country: str, region: str, cursor: Optional[Tuple[datetime, str]]):
+        pool = get_db_pool()
+        params: List[Any] = [country, region]
+        where_sql = "active = true and country = $1 and region = $2"
 
         if cursor:
-            q = q.start_after([cursor[0], col.document(cursor[1])])
+            params.extend([cursor[0], cursor[1]])
+            where_sql += " and (created_at, ad_id) < ($3, $4)"
 
-        docs = list(q.limit(PAGE_SIZE + 1).stream())
-        has_next = len(docs) > PAGE_SIZE
-        docs = docs[:PAGE_SIZE]
+        sql = f"""
+            select
+                ad_id,
+                text_short as text,
+                text_norm,
+                vehicle,
+                phone,
+                weight,
+                country,
+                country_label,
+                region,
+                region_label,
+                link,
+                active,
+                created_at,
+                updated_at,
+                expires_at
+            from truck_ads
+            where {where_sql}
+            order by created_at desc, ad_id desc
+            limit {PAGE_SIZE + 1}
+        """
 
-        items, next_cursor = [], None
-        for d in docs:
-            x = d.to_dict() or {}
-            x["_id"] = d.id
-            items.append(x)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
 
-        if docs:
-            last = docs[-1]
-            ld = last.to_dict() or {}
-            created_at = ld.get("createdAt")
-            if isinstance(created_at, datetime):
-                next_cursor = (created_at, last.id)
+        has_next = len(rows) > PAGE_SIZE
+        rows = rows[:PAGE_SIZE]
+        items = [dict(r) for r in rows]
+
+        next_cursor = None
+        if rows:
+            last = rows[-1]
+            next_cursor = (last["created_at"], last["ad_id"])
 
         return items, next_cursor, has_next
 
@@ -166,8 +201,8 @@ def register_truck_module(dp, bot, deps: dict):
         return [buttons[i:i + row_size] for i in range(0, len(buttons), row_size)]
 
     def format_truck_item(ad: dict, idx: int) -> str:
-        country_label = ad.get("countryLabel") or "—"
-        region_label = ad.get("regionLabel") or "—"
+        country_label = ad.get("country_label") or "—"
+        region_label = ad.get("region_label") or "—"
         vehicle = ad.get("vehicle") or "Ko‘rsatilmagan"
         phone = ad.get("phone") or "Ko‘rsatilmagan"
         weight = ad.get("weight") or "—"
@@ -211,7 +246,7 @@ def register_truck_module(dp, bot, deps: dict):
         for i, ad in enumerate(items, start=1):
             vehicle = ad.get("vehicle") or "—"
             phone = ad.get("phone") or "—"
-            region_label = ad.get("regionLabel") or ad.get("countryLabel") or "—"
+            region_label = ad.get("region_label") or ad.get("country_label") or "—"
             link = ad.get("link")
             details = f'<a href="{link}">Batafsil</a>' if link else "Batafsil yo‘q"
             short.append(
@@ -241,8 +276,8 @@ def register_truck_module(dp, bot, deps: dict):
     async def send_country_menu(chat_id: int, sid: str):
         await delete_session_messages(chat_id, sid)
 
-        total = get_total_count()
-        countries = get_country_counts()
+        total = await get_total_count()
+        countries = await get_country_counts()
 
         if total <= 0 or not countries:
             m = await bot.send_message(
@@ -279,8 +314,8 @@ def register_truck_module(dp, bot, deps: dict):
 
         await delete_session_messages(chat_id, sid)
 
-        regions = get_region_counts(country)
-        country_counts = get_country_counts()
+        regions = await get_region_counts(country)
+        country_counts = await get_country_counts()
         country_label = next((x["label"] for x in country_counts if x["id"] == country), country.title())
 
         if not regions:
@@ -354,7 +389,7 @@ def register_truck_module(dp, bot, deps: dict):
             if cached:
                 items, next_cursor, has_next = cached
             else:
-                items, next_cursor, has_next = query_country_page(country, cursor)
+                items, next_cursor, has_next = await query_country_page(country, cursor)
                 cache_set(key, items, next_cursor, has_next)
         else:
             key = ("region", country or "-", region or "-", cursor_key[0], cursor_key[1])
@@ -362,7 +397,7 @@ def register_truck_module(dp, bot, deps: dict):
             if cached:
                 items, next_cursor, has_next = cached
             else:
-                items, next_cursor, has_next = query_region_page(country, region, cursor)
+                items, next_cursor, has_next = await query_region_page(country, region, cursor)
                 cache_set(key, items, next_cursor, has_next)
 
         if not items:
@@ -407,7 +442,7 @@ def register_truck_module(dp, bot, deps: dict):
     async def trucks_root(message: types.Message):
         if message.chat.type != "private":
             return
-        if not is_registered(message.from_user.id):
+        if not await is_registered(message.from_user.id):
             await message.answer("Avval /start orqali ro‘yxatdan o‘ting.")
             return
 
@@ -448,7 +483,7 @@ def register_truck_module(dp, bot, deps: dict):
             await callback.answer("Sessiya tugagan", show_alert=True)
             return
 
-        country_counts = get_country_counts()
+        country_counts = await get_country_counts()
         country_label = next((x["label"] for x in country_counts if x["id"] == country), country.title())
 
         sess["mode"] = "list_country"
@@ -474,7 +509,7 @@ def register_truck_module(dp, bot, deps: dict):
             await callback.answer("Sessiya tugagan", show_alert=True)
             return
 
-        region_counts = get_region_counts(country)
+        region_counts = await get_region_counts(country)
         region_label = next((x["label"] for x in region_counts if x["id"] == region), region.title())
 
         sess["mode"] = "list_region"
