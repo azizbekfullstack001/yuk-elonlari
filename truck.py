@@ -30,95 +30,67 @@ _TRUCK_OFFER_PHRASES = [
     r"\bюк\s+нужно\b",
     r"\byuk\s+kk\b",
     r"\byuk\s+kere\b",
+    r"\bнужен\s+груз\b",
+    r"\bнужна\s+загрузка\b",
+    r"\bищу\s+груз\b",
+    r"\bвозьму\s+груз\b",
+    r"\byuk\s+olamiz\b",
+    r"\byuk\s+bol[`'']?sa\s+olamiz\b",
+    r"\bюк\s+оламиз\b",
+    r"\bюк\s+б[уў]лса\s+оламиз\b",
 
     r"\bmashina\s+bor\b",
     r"\bмашина\s+есть\b",
     r"\bмашина\s+бор\b",
-    r"\bmashina\s+kerak\b",
-    r"\bмашина\s+керак\b",
-    r"\bмашина\s+нужн",
+    r"\bесть\s+машина\b",
 
     r"\bfura\s+bor\b",
-    r"\bfura\s+kerak\b",
-    r"\bfura\s+kk\b",
     r"\bфура\s+есть\b",
     r"\bфура\s+бор\b",
-    r"\bфура\s+керак\b",
-    r"\bфура\s+нужн",
+    r"\bесть\s+фура\b",
 
     r"\btent\s+bor\b",
-    r"\btent\s+kerak\b",
-    r"\btent\s+kk\b",
     r"\bтент\s+есть\b",
     r"\bтент\s+бор\b",
-    r"\bтент\s+керак\b",
-    r"\bтент\s+нужн",
+    r"\bесть\s+тент\b",
 
     r"\bref\s+bor\b",
-    r"\bref\s+kerak\b",
-    r"\bref\s+kk\b",
     r"\bреф\s+есть\b",
     r"\bреф\s+бор\b",
-    r"\bреф\s+керак\b",
-    r"\bреф\s+нужн",
+    r"\bесть\s+реф\b",
     r"\brefrijerator\s+bor\b",
-    r"\brefrijerator\s+kerak\b",
-    r"\brefrijerator\s+kk\b",
     r"\bрефрижератор\s+есть\b",
     r"\bрефрижератор\s+бор\b",
-    r"\bрефрижератор\s+керак\b",
-    r"\bрефрижератор\s+нужн",
     r"\brefka\s+bor\b",
-    r"\brefka\s+kerak\b",
     r"\bрефка\s+есть\b",
     r"\bрефка\s+бор\b",
 
     r"\blabo\s+bor\b",
-    r"\blabo\s+kerak\b",
-    r"\blabo\s+kk\b",
     r"\bлабо\s+есть\b",
     r"\bлабо\s+бор\b",
-    r"\bлабо\s+керак\b",
 
     r"\bisuzu\s+bor\b",
-    r"\bisuzu\s+kerak\b",
-    r"\bisuzu\s+kk\b",
+    r"\bесть\s+isuzu\b",
 
     r"\bkamaz\s+bor\b",
-    r"\bkamaz\s+kerak\b",
-    r"\bkamaz\s+kk\b",
     r"\bкамаз\s+есть\b",
     r"\bкамаз\s+бор\b",
-    r"\bкамаз\s+керак\b",
-    r"\bкамаз\s+нужн",
+    r"\bесть\s+камаз\b",
 
     r"\bhowo\s+bor\b",
-    r"\bhowo\s+kerak\b",
-    r"\bhowo\s+kk\b",
     r"\bhovo\s+bor\b",
-    r"\bhovo\s+kerak\b",
-    r"\bhovo\s+kk\b",
     r"\bхово\s+есть\b",
     r"\bхово\s+бор\b",
-    r"\bхово\s+керак\b",
 
     r"\bgazel\s+bor\b",
-    r"\bgazel\s+kerak\b",
-    r"\bgazel\s+kk\b",
     r"\bгазель\s+есть\b",
     r"\bгазель\s+бор\b",
-    r"\bгазель\s+керак\b",
 
     r"\bsprinter\s+bor\b",
-    r"\bsprinter\s+kerak\b",
-    r"\bsprinter\s+kk\b",
     r"\bспринтер\s+есть\b",
     r"\bспринтер\s+бор\b",
-    r"\bспринтер\s+керак\b",
 
     r"\bman\s+bor\b",
-    r"\bman\s+kerak\b",
-    r"\bman\s+kk\b",
 
     r"\bbosh\s+mashina\b",
     r"\bbo[''`]?sh\s+mashina\b",
@@ -127,6 +99,9 @@ _TRUCK_OFFER_PHRASES = [
     r"\bпустая\s+машин",
     r"\byuksiz\b",
     r"\bбез\s+груза\b",
+
+    r"\bjonab\s+ketamiz\b",
+    r"\bжўнаб\s+кетамиз\b",
 ]
 
 _TRUCK_OFFER_RE = [re.compile(p, re.IGNORECASE) for p in _TRUCK_OFFER_PHRASES]
@@ -143,8 +118,10 @@ _TRUCK_NEGATIVE_PHRASES = [
     r"\bskidka\b",
     r"\bакция\b",
     r"\bчисто\s+груз\b",
-    r"\bюк\s+bor\b",
+    r"\byuk\s+bor\b",
+    r"\bюк\s+бор\b",
     r"\bюк\s+есть\b",
+    r"\bгруз\s+есть\b",
 ]
 _TRUCK_NEGATIVE_RE = [re.compile(p, re.IGNORECASE) for p in _TRUCK_NEGATIVE_PHRASES]
 
@@ -379,11 +356,12 @@ def shorten_truck_preview(text: str, max_len: int = 160) -> str:
 
 
 def register_truck_module(dp, bot, deps: dict):
-    get_db_pool     = deps["get_db_pool"]
-    is_registered   = deps["is_registered"]
-    kb_main_menu    = deps["kb_main_menu"]
-    escape_html     = deps["escape_html"]
-    make_session_id = deps["make_session_id"]
+    get_db_pool      = deps["get_db_pool"]
+    is_registered    = deps["is_registered"]
+    kb_main_menu     = deps["kb_main_menu"]
+    escape_html      = deps["escape_html"]
+    make_session_id  = deps["make_session_id"]
+    telethon_client  = deps["telethon_client"]
 
     def cache_get(key):
         v = TRUCK_CACHE.get(key)
@@ -538,16 +516,15 @@ def register_truck_module(dp, bot, deps: dict):
         link    = ad.get("link")
 
         hudud = region_label if region_label != "—" else country_label
-        valid_link = bool(link and re.match(r"^https://t\.me/[A-Za-z0-9_]{5,}/\d+$", link))
-        details = f'<a href="{link}">Batafsil</a>' if valid_link else "Batafsil yo'q"
+        link_part = f'\n🔗 <a href="{link}">Manba</a>' if link else ""
 
         return (
             f"<b>{idx}.</b> 📍 <b>Hudud:</b> {escape_html(hudud)}\n"
             f"🚚 <b>Mashina:</b> {escape_html(vehicle)}\n"
             f"⚖️ <b>Sig'im:</b> {escape_html(weight)}\n"
             f"📞 <b>Telefon:</b> {escape_html(phone)}\n"
-            f"📝 <b>Qisqa:</b> {escape_html(text)}\n"
-            f"🔗 {details}"
+            f"📝 <b>Qisqa:</b> {escape_html(text)}"
+            f"{link_part}"
         )
 
     def build_page_text(items: List[dict], title: str, page: int) -> str:
@@ -698,9 +675,10 @@ def register_truck_module(dp, bot, deps: dict):
     async def send_list_page(chat_id: int, sid: str, page: int):
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess:
-            await bot.send_message(chat_id, "Sessiya tugagan.", reply_markup=kb_main_menu())
+            await bot.send_message(chat_id, "Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", reply_markup=kb_main_menu())
             return
 
+        sess["created"] = time.time()
         await delete_session_messages(chat_id, sid)
 
         mode    = sess.get("mode")
@@ -745,6 +723,19 @@ def register_truck_module(dp, bot, deps: dict):
                 cursors[page + 1] = next_cursor
 
         rows = []
+        detail_row = []
+        for i, ad in enumerate(items):
+            ad_id = ad.get("ad_id") or ""
+            detail_row.append(InlineKeyboardButton(
+                text=f"📋 {i+1}",
+                callback_data=f"truck_detail:{ad_id}"
+            ))
+            if len(detail_row) == 5:
+                rows.append(detail_row)
+                detail_row = []
+        if detail_row:
+            rows.append(detail_row)
+
         nav  = []
         if page > 0:
             nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"tr_page:{sid}:{page-1}"))
@@ -800,8 +791,9 @@ def register_truck_module(dp, bot, deps: dict):
             return
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess or callback.from_user.id != sess.get("uid"):
-            await callback.answer("Sessiya tugagan", show_alert=True)
+            await callback.answer("Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", show_alert=True)
             return
+        sess["created"] = time.time()
         await callback.answer()
         await send_region_menu(callback.message.chat.id, sid, country)
 
@@ -814,9 +806,10 @@ def register_truck_module(dp, bot, deps: dict):
             return
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess or callback.from_user.id != sess.get("uid"):
-            await callback.answer("Sessiya tugagan", show_alert=True)
+            await callback.answer("Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", show_alert=True)
             return
 
+        sess["created"] = time.time()
         country_counts = await get_country_counts()
         country_label  = next(
             (x["label"] for x in country_counts if x["id"] == country),
@@ -842,9 +835,10 @@ def register_truck_module(dp, bot, deps: dict):
             return
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess or callback.from_user.id != sess.get("uid"):
-            await callback.answer("Sessiya tugagan", show_alert=True)
+            await callback.answer("Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", show_alert=True)
             return
 
+        sess["created"] = time.time()
         region_counts = await get_region_counts(country)
         region_label  = next(
             (x["label"] for x in region_counts if x["id"] == region),
@@ -871,8 +865,9 @@ def register_truck_module(dp, bot, deps: dict):
             return
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess or callback.from_user.id != sess.get("uid"):
-            await callback.answer("Sessiya tugagan", show_alert=True)
+            await callback.answer("Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", show_alert=True)
             return
+        sess["created"] = time.time()
         await callback.answer()
         await send_list_page(callback.message.chat.id, sid, page)
 
@@ -885,8 +880,9 @@ def register_truck_module(dp, bot, deps: dict):
             return
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess or callback.from_user.id != sess.get("uid"):
-            await callback.answer("Sessiya tugagan", show_alert=True)
+            await callback.answer("Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", show_alert=True)
             return
+        sess["created"] = time.time()
         await callback.answer()
         await send_country_menu(callback.message.chat.id, sid)
 
@@ -899,7 +895,67 @@ def register_truck_module(dp, bot, deps: dict):
             return
         sess = TRUCK_UI_SESSIONS.get(sid)
         if not sess or callback.from_user.id != sess.get("uid"):
-            await callback.answer("Sessiya tugagan", show_alert=True)
+            await callback.answer("Qayta boshlang: 🚚 Yuk mashinalar e'lonlari", show_alert=True)
             return
+        sess["created"] = time.time()
         await callback.answer()
         await send_region_menu(callback.message.chat.id, sid, country)
+
+    @dp.callback_query(F.data.startswith("truck_detail:"))
+    async def truck_detail(callback: types.CallbackQuery):
+        try:
+            _, ad_id = callback.data.split(":", 1)
+        except Exception:
+            await callback.answer("Xato", show_alert=True)
+            return
+
+        pool = get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT text_full, link, phone, source_chat_id, source_message_id, active "
+                "FROM truck_ads WHERE ad_id=$1", ad_id
+            )
+
+        if not row:
+            await callback.answer("E'lon topilmadi", show_alert=True)
+            return
+
+        await callback.answer()
+        uid = callback.from_user.id
+        chat_id = callback.message.chat.id
+
+        # Oldingi detail xabarni o'chirish
+        detail_key = f"truck_detail_{uid}"
+        old_mids = TRUCK_UI_SESSIONS.get(detail_key, {}).get("mids", [])
+        if old_mids:
+            await asyncio.gather(
+                *[bot.delete_message(chat_id, mid) for mid in old_mids],
+                return_exceptions=True,
+            )
+
+        text_full = row["text_full"] or "Matn yo'q"
+        phone = row["phone"] or ""
+        link = row["link"] or ""
+        active = row["active"]
+
+        if active:
+            msg = f"📋 <b>To'liq e'lon:</b>\n\n{escape_html(text_full)}"
+        else:
+            msg = "⚠️ <b>Xabar guruhdan o'chirilgan.</b>\n\n"
+            msg += f"📋 <b>Saqlangan matn:</b>\n\n{escape_html(text_full)}"
+
+        if phone:
+            msg += f"\n\n📞 <b>Telefon:</b> {escape_html(phone)}"
+        if link:
+            msg += f"\n\n🔗 <a href=\"{link}\">Manba</a>"
+
+        if len(msg) > 4000:
+            msg = msg[:4000] + "..."
+
+        m = await bot.send_message(
+            chat_id,
+            msg,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        TRUCK_UI_SESSIONS[detail_key] = {"mids": [m.message_id], "created": time.time()}

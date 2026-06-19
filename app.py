@@ -29,7 +29,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
-from truck import register_truck_module
+from truck import register_truck_module, is_truck_offer_message, TRUCK_UI_SESSIONS
 
 
 logging.basicConfig(
@@ -109,9 +109,20 @@ TRUCK_KEYWORDS = [
     "fura bor",
     "isuzu bor",
     "ref bor",
+    "tent bor",
+    "kamaz bor",
+    "hovo bor",
+    "howo bor",
+    "gazel bor",
+    "sprinter bor",
+    "labo bor",
+    "man bor",
     "yuk olamiz",
     "yuk bolsa olamiz",
     "yuk bo'lsa olamiz",
+    "bosh mashina",
+    "yuksiz",
+    "jonab ketamiz",
 
     # o'zbekcha (kiril)
     "юк керак",
@@ -121,9 +132,16 @@ TRUCK_KEYWORDS = [
     "фура бор",
     "исузу бор",
     "реф бор",
+    "тент бор",
+    "камаз бор",
+    "хово бор",
+    "газель бор",
+    "спринтер бор",
+    "лабо бор",
     "юк оламиз",
     "юк булса оламиз",
     "юк бўлса оламиз",
+    "буш машина",
 
     # ruscha
     "груз нужен",
@@ -134,13 +152,14 @@ TRUCK_KEYWORDS = [
     "ищу груз",
     "возьму груз",
     "есть машина",
-    "нужна машина",
     "есть фура",
-    "нужна фура",
     "есть реф",
-    "нужен реф",
+    "есть тент",
+    "есть камаз",
     "есть isuzu",
-    "нужен isuzu",
+    "без груза",
+    "пустая машин",
+    "пустой машин",
 ]
 
 
@@ -153,6 +172,15 @@ CARGO_KEYWORDS = [
     "yuk bor", "юк бор", "юк есть",
     " tonna", " тонна",
     "kg yuk", "кг юк",
+    "fura kerak", "фура керак", "фура нужн", "нужна фура",
+    "tent kerak", "тент керак", "тент нужн", "нужен тент",
+    "ref kerak", "реф керак", "реф нужн", "нужен реф",
+    "mashina kerak", "машина керак", "машина нужн", "нужна машина",
+    "isuzu kerak", "kamaz kerak", "камаз керак", "камаз нужн",
+    "hovo kerak", "howo kerak", "хово керак",
+    "gazel kerak", "газель керак",
+    "sprinter kerak", "спринтер керак",
+    "labo kerak", "лабо керак",
     "mandarin", "мандарин",
     "kartoshka", "картошка",
     "piyoz", "лук",
@@ -344,6 +372,65 @@ def normalize_place_token(s: str) -> str:
     s = re.sub(r"\b(sh|shahar|tumani|tuman|viloyati|viloyat|rayon|oblast|город|район|область)\b\.?", "", s).strip()
     return re.sub(r"\s+", " ", s)
 
+# Lotin → Kiril transliteratsiya
+_LAT_TO_CYR = {
+    "yo": "ё", "yu": "ю", "ya": "я", "ye": "е",
+    "sh": "ш", "ch": "ч", "ng": "нг",
+    "a": "а", "b": "б", "v": "в", "g": "г", "d": "д",
+    "e": "е", "z": "з", "i": "и", "y": "й",
+    "k": "к", "l": "л", "m": "м", "n": "н", "o": "о",
+    "p": "п", "r": "р", "s": "с", "t": "т", "u": "у",
+    "f": "ф", "x": "х", "j": "ж", "h": "ҳ",
+    "q": "қ", "w": "в",
+}
+
+_CYR_TO_LAT = {
+    "ш": "sh", "ч": "ch", "ё": "yo", "ю": "yu", "я": "ya",
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
+    "е": "e", "ж": "j", "з": "z", "и": "i", "й": "y",
+    "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "x", "ҳ": "h", "қ": "q", "ғ": "g",
+    "ў": "o", "э": "e", "ы": "i", "ц": "s",
+}
+
+def lat_to_cyr(text: str) -> str:
+    result = []
+    i = 0
+    t = text.lower()
+    while i < len(t):
+        if i + 1 < len(t) and t[i:i+2] in _LAT_TO_CYR:
+            result.append(_LAT_TO_CYR[t[i:i+2]])
+            i += 2
+        elif t[i] in _LAT_TO_CYR:
+            result.append(_LAT_TO_CYR[t[i]])
+            i += 1
+        else:
+            result.append(t[i])
+            i += 1
+    return "".join(result)
+
+def cyr_to_lat(text: str) -> str:
+    result = []
+    for ch in text.lower():
+        if ch in _CYR_TO_LAT:
+            result.append(_CYR_TO_LAT[ch])
+        else:
+            result.append(ch)
+    return "".join(result)
+
+def transliterate_place(place: str) -> List[str]:
+    """Har bir joy nomi uchun lotin va kiril variantlarini qaytaradi"""
+    place = place.lower().strip()
+    variants = {place}
+    # Lotin harflar bormi?
+    if re.search(r"[a-z]", place):
+        variants.add(lat_to_cyr(place))
+    # Kiril harflar bormi?
+    if re.search(r"[а-яқғҳўё]", place):
+        variants.add(cyr_to_lat(place))
+    return list(variants)
+
 def make_message_link(chat_id: int, message_id: int, chat_username: Optional[str]) -> Optional[str]:
     if chat_username:
         return f"https://t.me/{chat_username}/{message_id}"
@@ -445,9 +532,13 @@ def _media_input(value: Optional[str]):
 def welcome_caption() -> str:
     return (
         f"🚛 <b>{escape_html(BOT_NAME)}</b>\n\n"
-        "Assalomu alaykum!\n"
-        "Bu bot orqali yuk e'lonlari va yuk mashinalari e'lonlarini qulay ko'rishingiz mumkin.\n\n"
-        "📱 Davom etish uchun kontaktingizni ulashing."
+        "Assalomu alaykum! Xush kelibsiz!\n\n"
+        "📦 <b>Yuk e'lonlari</b> — yuk bor, mashina kerak bo'lgan e'lonlarni qidiring\n"
+        "🚚 <b>Yuk mashinalar</b> — bo'sh mashina bor, yuk qidirayotgan haydovchilar e'lonlari\n\n"
+        "🔍 Shahar yoki viloyat nomi bo'yicha qulay qidiruv\n"
+        "📋 Har bir e'lonning to'liq ma'lumotini ko'rish\n"
+        "🔄 Yangi e'lonlar real vaqtda yangilanadi\n\n"
+        "👇 Davom etish uchun pastdagi tugmani bosing."
     )
 
 async def setup_bot_ui():
@@ -464,21 +555,17 @@ async def setup_bot_ui():
     except Exception:
         log.exception("set_chat_menu_button error")
 
+def kb_continue():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Davom etish")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
 async def send_welcome_media(message: types.Message):
     caption = welcome_caption()
-
-    animation = _media_input(WELCOME_ANIMATION)
-    if animation:
-        try:
-            await message.answer_animation(
-                animation=animation,
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=kb_request_contact(),
-            )
-            return
-        except Exception:
-            log.exception("welcome animation send error")
 
     photo = _media_input(WELCOME_PHOTO)
     if photo:
@@ -487,7 +574,7 @@ async def send_welcome_media(message: types.Message):
                 photo=photo,
                 caption=caption,
                 parse_mode="HTML",
-                reply_markup=kb_request_contact(),
+                reply_markup=kb_continue(),
             )
             return
         except Exception:
@@ -496,7 +583,7 @@ async def send_welcome_media(message: types.Message):
     await message.answer(
         caption,
         parse_mode="HTML",
-        reply_markup=kb_request_contact(),
+        reply_markup=kb_continue(),
     )
 
 
@@ -511,7 +598,7 @@ def get_pool() -> asyncpg.Pool:
 
 async def init_db():
     global DB_POOL
-    DB_POOL = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10, command_timeout=60)
+    DB_POOL = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10, command_timeout=60, statement_cache_size=0)
     async with DB_POOL.acquire() as conn:
         await conn.execute("select 1")
     log.info("Postgres ulandi.")
@@ -599,7 +686,7 @@ async def save_cargo_ad(chat_id, message_id, chat_title, chat_username, text, ms
     return True, "saved"
 
 async def save_truck_ad(chat_id, message_id, chat_title, chat_username, text, msg_date_utc):
-    if not is_truck_ad(text):
+    if not is_truck_offer_message(text):
         return False, "filtered"
 
     link = make_message_link(chat_id, message_id, chat_username)
@@ -682,13 +769,29 @@ async def deactivate_by_source(chat_id: int, message_id: int) -> int:
 # ═══════════════════════════════════════════════════════════════════════
 
 async def query_cargo_page(place1: str, place2: Optional[str], cursor: Optional[Tuple[datetime, str]]):
-    conditions = ["active = true", "(from_place = $1 or to_place = $1 or $1 = any(places))"]
-    params: List[Any] = [place1]
-    idx = 2
-    if place2:
-        conditions.append(f"(from_place = ${idx} or to_place = ${idx} or ${idx} = any(places))")
-        params.append(place2)
+    # Transliteratsiya — lotin va kiril variantlarini qidirish
+    place1_variants = transliterate_place(place1)
+    place2_variants = transliterate_place(place2) if place2 else []
+
+    # place1 uchun OR condition
+    place1_conds = []
+    params: List[Any] = []
+    idx = 1
+    for v in place1_variants:
+        place1_conds.append(f"(from_place = ${idx} or to_place = ${idx} or ${idx} = any(places))")
+        params.append(v)
         idx += 1
+    conditions = ["active = true", f"({' or '.join(place1_conds)})"]
+
+    # place2 uchun OR condition
+    if place2_variants:
+        place2_conds = []
+        for v in place2_variants:
+            place2_conds.append(f"(from_place = ${idx} or to_place = ${idx} or ${idx} = any(places))")
+            params.append(v)
+            idx += 1
+        conditions.append(f"({' or '.join(place2_conds)})")
+
     if cursor:
         conditions.append(f"(created_at, ad_id) < (${idx}, ${idx+1})")
         params.extend([cursor[0], cursor[1]])
@@ -709,13 +812,26 @@ async def query_cargo_page(place1: str, place2: Optional[str], cursor: Optional[
     return [dict(r) for r in rows], (rows[-1]["created_at"], rows[-1]["ad_id"]) if rows else None, has_next
 
 async def fallback_scan_ads(place1: str, place2: Optional[str], offset: int = 0):
-    p1 = normalize_place_token(place1)
-    p2 = normalize_place_token(place2) if place2 else None
-    conditions = ["active = true", "text_norm like $1"]
-    params: List[Any] = [f"%{p1}%"]
-    if p2:
-        conditions.append("text_norm like $2")
-        params.append(f"%{p2}%")
+    p1_variants = transliterate_place(normalize_place_token(place1))
+    p2_variants = transliterate_place(normalize_place_token(place2)) if place2 else []
+
+    # Har bir variant uchun LIKE condition
+    p1_conds = []
+    params: List[Any] = []
+    idx = 1
+    for v in p1_variants:
+        p1_conds.append(f"text_norm like ${idx}")
+        params.append(f"%{v}%")
+        idx += 1
+    conditions = ["active = true", f"({' or '.join(p1_conds)})"]
+
+    if p2_variants:
+        p2_conds = []
+        for v in p2_variants:
+            p2_conds.append(f"text_norm like ${idx}")
+            params.append(f"%{v}%")
+            idx += 1
+        conditions.append(f"({' or '.join(p2_conds)})")
 
     sql = f"""select ad_id,text_short as text,text_norm,from_place,to_place,places,cargo_name,
                      vehicle_need,phone,weight,link,source_title,source_username,source_chat_id,
@@ -739,8 +855,8 @@ async def fallback_scan_ads(place1: str, place2: Optional[str], offset: int = 0)
 # ═══════════════════════════════════════════════════════════════════════
 
 class Register(StatesGroup):
-    waiting_contact  = State()
     waiting_fullname = State()
+    waiting_contact  = State()
 
 class CargoSearch(StatesGroup):
     waiting_place = State()
@@ -770,13 +886,29 @@ def kb_cancel():
         resize_keyboard=True
     )
 
-def build_page_keyboard(session_id, page, has_prev, has_next):
-    row = []
+def build_page_keyboard(session_id, page, has_prev, has_next, items=None):
+    rows = []
+    if items:
+        detail_row = []
+        for i, ad in enumerate(items):
+            ad_id = ad.get("ad_id") or ""
+            detail_row.append(InlineKeyboardButton(
+                text=f"📋 {i+1}",
+                callback_data=f"cargo_detail:{ad_id}"
+            ))
+            if len(detail_row) == 5:
+                rows.append(detail_row)
+                detail_row = []
+        if detail_row:
+            rows.append(detail_row)
+    nav_row = []
     if has_prev:
-        row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"cargo_nav:{session_id}:{page-1}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"cargo_nav:{session_id}:{page-1}"))
     if has_next:
-        row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"cargo_nav:{session_id}:{page+1}"))
-    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
+        nav_row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"cargo_nav:{session_id}:{page+1}"))
+    if nav_row:
+        rows.append(nav_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -792,21 +924,22 @@ def short_route(ad):
     return places[0] if places else "—"
 
 def format_ad_item(ad, idx):
-    link          = ad.get("link")
-    details       = f'<a href="{link}">Batafsil</a>' if link else "Batafsil yo'q"
+    ad_id         = ad.get("ad_id") or ""
     cargo_name    = ad.get("cargo_name") or "Aniqlanmadi"
     vehicle_need  = ad.get("vehicle_need") or "Ko'rsatilmagan"
     weight        = ad.get("weight") or "—"
     phone         = ad.get("phone") or "Ko'rsatilmagan"
     text          = ad.get("text") or ""
+    link          = ad.get("link")
+    link_part     = f'\n🔗 <a href="{link}">Manba</a>' if link else ""
     return (
         f"<b>{idx}.</b> 📍 <b>Manzil:</b> {escape_html(short_route(ad))}\n"
         f"📦 <b>Yuk:</b> {escape_html(cargo_name)}\n"
         f"🚚 <b>Mashina:</b> {escape_html(vehicle_need)}\n"
         f"⚖️ <b>Vazn:</b> {escape_html(weight)}\n"
         f"📞 <b>Telefon:</b> {escape_html(phone)}\n"
-        f"📝 <b>Qisqa:</b> {escape_html(text)}\n"
-        f"🔗 {details}"
+        f"📝 <b>Qisqa:</b> {escape_html(text)}"
+        f"{link_part}"
     )
 
 def build_page_text(items, place1, place2, page):
@@ -906,7 +1039,7 @@ async def send_page(bot, chat_id, session_id, page):
         build_page_text(items, place1, place2, page),
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=build_page_keyboard(session_id, page, page > 0, has_next),
+        reply_markup=build_page_keyboard(session_id, page, page > 0, has_next, items),
     )
     sess["sent_msg_ids"] = [msg.message_id]
     SEARCH_SESSIONS[session_id] = sess
@@ -925,7 +1058,8 @@ register_truck_module(dp, bot, {
     "is_registered": is_registered,
     "kb_main_menu": kb_main_menu,
     "escape_html": escape_html,
-    "make_session_id": make_session_id
+    "make_session_id": make_session_id,
+    "telethon_client": telethon_client,
 })
 
 
@@ -960,13 +1094,38 @@ async def start(message: types.Message, state: FSMContext):
         )
         return
 
-    await state.set_state(Register.waiting_contact)
+    await state.set_state(Register.waiting_fullname)
     await send_welcome_media(message)
 
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Bekor qilindi. /start ni bosing.", reply_markup=types.ReplyKeyboardRemove())
+
+@dp.message(Register.waiting_fullname, F.text == "✅ Davom etish")
+async def continue_register(message: types.Message, state: FSMContext):
+    await message.answer(
+        "👤 <b>Ism familiyangizni kiriting</b>\n\nMasalan: <b>Ali Valiyev</b>",
+        parse_mode="HTML",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+@dp.message(Register.waiting_fullname, F.text)
+async def got_fullname(message: types.Message, state: FSMContext):
+    if message.text == "✅ Davom etish":
+        return
+    fullname = normalize_text(message.text)
+    if len(fullname) < 3 or " " not in fullname:
+        await message.answer("Ism va familiyani to'liq kiriting. Masalan: Ali Valiyev")
+        return
+
+    await state.update_data(fullname=fullname)
+    await state.set_state(Register.waiting_contact)
+    await message.answer(
+        "📱 <b>Kontaktingizni ulashing</b>\n\nPastdagi tugmani bosing.",
+        parse_mode="HTML",
+        reply_markup=kb_request_contact()
+    )
 
 @dp.message(Register.waiting_contact, F.contact)
 async def got_contact(message: types.Message, state: FSMContext):
@@ -975,38 +1134,31 @@ async def got_contact(message: types.Message, state: FSMContext):
         await message.answer("O'zingizning kontaktingizni yuboring.")
         return
 
+    data = await state.get_data()
+    fullname = data.get("fullname", "")
+
     await save_user(uid, {
         "phone": message.contact.phone_number,
         "tgUsername": message.from_user.username,
-        "registered": False,
-        "updatedAt": now_utc()
-    })
-    await state.set_state(Register.waiting_fullname)
-    await message.answer(
-        "Ism familiyangizni kiriting.\nMasalan: <b>Ali Valiyev</b>",
-        parse_mode="HTML",
-        reply_markup=types.ReplyKeyboardRemove()
-    )
-
-@dp.message(Register.waiting_contact)
-async def contact_required(message: types.Message):
-    await message.answer("📱 Kontakt ulashish tugmasini bosing.", reply_markup=kb_request_contact())
-
-@dp.message(Register.waiting_fullname, F.text)
-async def got_fullname(message: types.Message, state: FSMContext):
-    fullname = normalize_text(message.text)
-    if len(fullname) < 3 or " " not in fullname:
-        await message.answer("Ism va familiyani to'liq kiriting. Masalan: Ali Valiyev")
-        return
-
-    await save_user(message.from_user.id, {
         "fullname": fullname,
         "registered": True,
         "createdAt": now_utc(),
         "updatedAt": now_utc()
     })
     await state.clear()
-    await message.answer("✅ Ro'yxatdan o'tdingiz!\nMenyu:", reply_markup=kb_main_menu())
+    await message.answer(
+        f"✅ Ro'yxatdan o'tdingiz, <b>{escape_html(fullname)}</b>!\n\nMenyu:",
+        parse_mode="HTML",
+        reply_markup=kb_main_menu()
+    )
+
+@dp.message(Register.waiting_contact)
+async def contact_required(message: types.Message):
+    await message.answer("📱 Kontakt ulashish tugmasini bosing.", reply_markup=kb_request_contact())
+
+@dp.message(Register.waiting_fullname)
+async def fullname_required(message: types.Message):
+    await message.answer("👤 Ism familiyangizni kiriting. Masalan: Ali Valiyev")
 
 @dp.message(F.text == "📦 Yuk e'lonlari")
 async def cargo_menu(message: types.Message, state: FSMContext):
@@ -1015,6 +1167,17 @@ async def cargo_menu(message: types.Message, state: FSMContext):
     if not await is_registered(message.from_user.id):
         await message.answer("Avval /start orqali ro'yxatdan o'ting.")
         return
+
+    # Oldingi detail xabarlarini tozalash
+    uid = message.from_user.id
+    detail_key = f"detail_{uid}"
+    old_mids = SEARCH_SESSIONS.get(detail_key, {}).get("mids", [])
+    if old_mids:
+        await asyncio.gather(
+            *[bot.delete_message(message.chat.id, mid) for mid in old_mids],
+            return_exceptions=True,
+        )
+        SEARCH_SESSIONS.pop(detail_key, None)
 
     await state.set_state(CargoSearch.waiting_place)
     await message.answer(
@@ -1066,14 +1229,74 @@ async def cargo_nav(callback: types.CallbackQuery):
 
     sess = SEARCH_SESSIONS.get(sid)
     if not sess:
-        await callback.answer("Sessiya tugagan", show_alert=True)
+        await callback.answer("Qayta qidiring: 📦 Yuk e'lonlari", show_alert=True)
         return
     if callback.from_user.id != sess.get("uid"):
         await callback.answer("Bu sizniki emas", show_alert=True)
         return
 
+    sess["created"] = time.time()
     await callback.answer()
     await send_page(bot, callback.message.chat.id, sid, page)
+
+
+@dp.callback_query(F.data.startswith("cargo_detail:"))
+async def cargo_detail(callback: types.CallbackQuery):
+    try:
+        _, ad_id = callback.data.split(":", 1)
+    except Exception:
+        await callback.answer("Xato", show_alert=True)
+        return
+
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT text_full, link, phone, source_chat_id, source_message_id, active "
+            "FROM cargo_ads WHERE ad_id=$1", ad_id
+        )
+
+    if not row:
+        await callback.answer("E'lon topilmadi", show_alert=True)
+        return
+
+    await callback.answer()
+    uid = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    # Oldingi detail xabarni o'chirish
+    detail_key = f"detail_{uid}"
+    old_mids = SEARCH_SESSIONS.get(detail_key, {}).get("mids", [])
+    if old_mids:
+        await asyncio.gather(
+            *[bot.delete_message(chat_id, mid) for mid in old_mids],
+            return_exceptions=True,
+        )
+
+    text_full = row["text_full"] or "Matn yo'q"
+    phone = row["phone"] or ""
+    link = row["link"] or ""
+    active = row["active"]
+
+    if active:
+        msg = f"📋 <b>To'liq e'lon:</b>\n\n{escape_html(text_full)}"
+    else:
+        msg = "⚠️ <b>Xabar guruhdan o'chirilgan.</b>\n\n"
+        msg += f"📋 <b>Saqlangan matn:</b>\n\n{escape_html(text_full)}"
+
+    if phone:
+        msg += f"\n\n📞 <b>Telefon:</b> {escape_html(phone)}"
+    if link:
+        msg += f"\n\n🔗 <a href=\"{link}\">Manba</a>"
+
+    if len(msg) > 4000:
+        msg = msg[:4000] + "..."
+
+    m = await bot.send_message(
+        chat_id,
+        msg,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    SEARCH_SESSIONS[detail_key] = {"mids": [m.message_id], "created": time.time()}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1104,7 +1327,7 @@ async def on_new_message(event: events.NewMessage.Event):
         if not event.chat_id:
             return
 
-        truck = is_truck_ad(text)
+        truck = is_truck_offer_message(text)
         cargo = is_cargo_ad(text)
 
         if not truck and not cargo:
@@ -1155,6 +1378,7 @@ async def ingest_worker(worker_id: int):
             return
         cargo_n = truck_n = 0
         for it in buf:
+            saved_as_cargo = False
             try:
                 ok, _ = await save_cargo_ad(
                     it["chat_id"], it["message_id"], it["chat_title"],
@@ -1162,18 +1386,20 @@ async def ingest_worker(worker_id: int):
                 )
                 if ok:
                     cargo_n += 1
+                    saved_as_cargo = True
             except Exception:
                 log.exception("save_cargo_ad error")
 
-            try:
-                ok2, _ = await save_truck_ad(
-                    it["chat_id"], it["message_id"], it["chat_title"],
-                    it["chat_username"], it["text"], it["msg_date"]
-                )
-                if ok2:
-                    truck_n += 1
-            except Exception:
-                log.exception("save_truck_ad error")
+            if not saved_as_cargo:
+                try:
+                    ok2, _ = await save_truck_ad(
+                        it["chat_id"], it["message_id"], it["chat_title"],
+                        it["chat_username"], it["text"], it["msg_date"]
+                    )
+                    if ok2:
+                        truck_n += 1
+                except Exception:
+                    log.exception("save_truck_ad error")
 
         log.info(
             "worker[%s] flushed=%s cargo=%s truck=%s queue=%s",
@@ -1241,8 +1467,12 @@ async def gc_task():
         try:
             now_ts = time.time()
             for sid in list(SEARCH_SESSIONS):
-                if now_ts - SEARCH_SESSIONS[sid].get("created", now_ts) > 1200:
+                if now_ts - SEARCH_SESSIONS[sid].get("created", now_ts) > 86400:
                     SEARCH_SESSIONS.pop(sid, None)
+
+            for sid in list(TRUCK_UI_SESSIONS):
+                if now_ts - TRUCK_UI_SESSIONS[sid].get("created", now_ts) > 86400:
+                    TRUCK_UI_SESSIONS.pop(sid, None)
 
             for k in list(CACHE):
                 if now_ts - CACHE[k][0] > CACHE_TTL:
