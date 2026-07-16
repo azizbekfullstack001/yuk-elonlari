@@ -1,6 +1,7 @@
 venv/
 .env
 *.session
+_new_session.txt
 serviceAccountKey.json
 __pycache__/
 *.pyc

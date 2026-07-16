@@ -554,7 +554,7 @@ def register_truck_module(dp, bot, deps: dict):
             phone        = ad.get("phone")   or "—"
             region_label = ad.get("region_label") or ad.get("country_label") or "—"
             link         = ad.get("link")
-            valid_link   = bool(link and re.match(r"^https://t\.me/[A-Za-z0-9_]{5,}/\d+$", link))
+            valid_link   = bool(link and re.match(r"^https://t\.me/(?:c/\d+|[A-Za-z0-9_]{4,})/\d+$", link))
             details      = f'<a href="{link}">Batafsil</a>' if valid_link else "Batafsil yo'q"
             short.append(
                 f"<b>{i}.</b> {escape_html(region_label)} | "

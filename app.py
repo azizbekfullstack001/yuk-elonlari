@@ -54,6 +54,7 @@ TG_SESSION        = os.getenv("TG_SESSION")
 BOT_NAME          = os.getenv("BOT_NAME", "Cargo Bot")
 WELCOME_PHOTO     = os.getenv("WELCOME_PHOTO")
 WELCOME_ANIMATION = os.getenv("WELCOME_ANIMATION")
+ADMIN_IDS_RAW     = os.getenv("ADMIN_IDS", "")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi")
@@ -68,6 +69,16 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 TG_API_ID = int(TG_API_ID)
+
+# Admin IDs
+ADMIN_IDS = set()
+for _aid in ADMIN_IDS_RAW.split(","):
+    _aid = _aid.strip()
+    if _aid.isdigit():
+        ADMIN_IDS.add(int(_aid))
+
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
 PAGE_SIZE           = 5
 AD_TTL_DAYS         = 2
@@ -437,10 +448,19 @@ def make_message_link(chat_id: int, message_id: int, chat_username: Optional[str
     s = str(chat_id)
     if s.startswith("-100"):
         return f"https://t.me/c/{s[4:]}/{message_id}"
+    # Oddiy guruhlar (supergroup emas) — manfiy id
+    if chat_id < 0:
+        return f"https://t.me/c/{abs(chat_id)}/{message_id}"
     return None
 
 def is_valid_message_link(link: Optional[str]) -> bool:
-    return bool(link and re.match(r"^https://t\.me/[A-Za-z0-9_]{5,}/\d+$", link))
+    """Public (t.me/username/id) va private (t.me/c/id/id) linklarni qabul qiladi."""
+    if not link:
+        return False
+    return bool(re.match(
+        r"^https://t\.me/(?:c/\d+|[A-Za-z0-9_]{4,})/\d+$",
+        link,
+    ))
 
 def cache_get(key):
     v = CACHE.get(key)
@@ -598,10 +618,153 @@ def get_pool() -> asyncpg.Pool:
 
 async def init_db():
     global DB_POOL
-    DB_POOL = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10, command_timeout=60, statement_cache_size=0)
+    DB_POOL = await asyncpg.create_pool(
+        dsn=DATABASE_URL, min_size=1, max_size=10,
+        command_timeout=60, statement_cache_size=0,
+    )
     async with DB_POOL.acquire() as conn:
         await conn.execute("select 1")
-    log.info("Postgres ulandi.")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                uid BIGINT PRIMARY KEY,
+                phone TEXT,
+                tg_username TEXT,
+                fullname TEXT,
+                registered BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cargo_ads (
+                ad_id TEXT PRIMARY KEY,
+                source_chat_id BIGINT NOT NULL,
+                source_message_id BIGINT NOT NULL,
+                source_key TEXT,
+                source_title TEXT,
+                source_username TEXT,
+                text_full TEXT NOT NULL,
+                text_short TEXT,
+                text_norm TEXT,
+                from_place TEXT,
+                to_place TEXT,
+                places TEXT[],
+                cargo_name TEXT,
+                vehicle_need TEXT,
+                phone TEXT,
+                weight TEXT,
+                link TEXT,
+                active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS truck_ads (
+                ad_id TEXT PRIMARY KEY,
+                source_chat_id BIGINT NOT NULL,
+                source_message_id BIGINT NOT NULL,
+                source_key TEXT,
+                source_title TEXT,
+                source_username TEXT,
+                text_full TEXT NOT NULL,
+                text_short TEXT,
+                text_norm TEXT,
+                vehicle TEXT,
+                phone TEXT,
+                weight TEXT,
+                country TEXT,
+                country_label TEXT,
+                region TEXT,
+                region_label TEXT,
+                link TEXT,
+                active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dedup_hashes (
+                hash TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS visits (
+                id SERIAL PRIMARY KEY,
+                uid BIGINT NOT NULL,
+                visited_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_ads (
+                id SERIAL PRIMARY KEY,
+                ad_type VARCHAR(10) NOT NULL DEFAULT 'cargo',
+                text_full TEXT NOT NULL,
+                posted_by BIGINT NOT NULL,
+                active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                expires_at TIMESTAMPTZ
+            )
+        """)
+
+        # Eski jadvalga yangi ustun qo'shish (agar yo'q bo'lsa)
+        await conn.execute("""
+            ALTER TABLE manual_ads
+            ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cargo_ads_active_created
+            ON cargo_ads (active, created_at DESC, ad_id DESC)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cargo_ads_expires
+            ON cargo_ads (expires_at)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cargo_ads_from_place
+            ON cargo_ads (from_place)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cargo_ads_to_place
+            ON cargo_ads (to_place)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_truck_ads_active_country
+            ON truck_ads (active, country, created_at DESC, ad_id DESC)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_truck_ads_active_region
+            ON truck_ads (active, country, region, created_at DESC, ad_id DESC)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_truck_ads_expires
+            ON truck_ads (expires_at)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dedup_hashes_expires
+            ON dedup_hashes (expires_at)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_visits_uid_at
+            ON visits (uid, visited_at DESC)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_manual_ads_expires
+            ON manual_ads (expires_at)
+        """)
+
+    log.info("Postgres ulandi, jadvallar tayyor.")
 
 async def get_user(uid: int) -> Optional[dict]:
     async with get_pool().acquire() as conn:
@@ -629,6 +792,14 @@ async def save_user(uid: int, data: dict):
 async def is_registered(uid: int) -> bool:
     u = await get_user(uid)
     return bool(u and u.get("registered") is True)
+
+async def log_visit(uid: int):
+    """Har bir foydalanuvchi tashrifi yoziladi"""
+    try:
+        async with get_pool().acquire() as conn:
+            await conn.execute("INSERT INTO visits(uid, visited_at) VALUES($1, NOW())", uid)
+    except Exception:
+        log.exception("log_visit error")
 
 async def try_dedup_lock(kind: str, text: str) -> Tuple[bool, str]:
     base   = text_hash_norm(text)
@@ -662,6 +833,9 @@ async def save_cargo_ad(chat_id, message_id, chat_title, chat_username, text, ms
     from_place, to_place = parse_route_from_to(text)
     places = extract_place_candidates(text)
     link   = make_message_link(chat_id, message_id, chat_username)
+    saved_at   = now_utc()
+    expires_at = saved_at + timedelta(days=AD_TTL_DAYS)
+    updated_at = saved_at
 
     async with get_pool().acquire() as conn:
         await conn.execute(
@@ -674,13 +848,32 @@ async def save_cargo_ad(chat_id, message_id, chat_title, chat_username, text, ms
                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
                    $14,$15,$16,$17,true,$18,$19,$20
                )
-               on conflict(ad_id) do nothing""",
+               on conflict(ad_id) do update set
+                   source_chat_id=excluded.source_chat_id,
+                   source_message_id=excluded.source_message_id,
+                   source_key=excluded.source_key,
+                   source_title=excluded.source_title,
+                   source_username=excluded.source_username,
+                   text_full=excluded.text_full,
+                   text_short=excluded.text_short,
+                   text_norm=excluded.text_norm,
+                   from_place=excluded.from_place,
+                   to_place=excluded.to_place,
+                   places=excluded.places,
+                   cargo_name=excluded.cargo_name,
+                   vehicle_need=excluded.vehicle_need,
+                   phone=excluded.phone,
+                   weight=excluded.weight,
+                   link=excluded.link,
+                   active=true,
+                   updated_at=excluded.updated_at,
+                   expires_at=excluded.expires_at""",
             ad_id, chat_id, message_id, source_key(chat_id, message_id),
             chat_title, chat_username,
             text, shorten_text(text, 170), normalize_text(text).lower(),
             from_place, to_place, places[:MAX_PLACES_TO_INDEX],
             parse_cargo_name(text), parse_vehicle_need(text), parse_phone(text), parse_weight(text),
-            link, created_at, now_utc(), created_at + timedelta(days=AD_TTL_DAYS),
+            link, created_at, updated_at, expires_at,
         )
     log.info("cargo SAVED chat=%s msg=%s", chat_id, message_id)
     return True, "saved"
@@ -690,8 +883,11 @@ async def save_truck_ad(chat_id, message_id, chat_title, chat_username, text, ms
         return False, "filtered"
 
     link = make_message_link(chat_id, message_id, chat_username)
-    if not is_valid_message_link(link):
-        return False, "no_public_link"
+    # Guruh/kanal e'lonlari uchun link bo'lishi kerak (public yoki private /c/).
+    # Qo'lda (admin/user) joylashtirilganda chat_id > 0 bo'ladi — link shart emas.
+    is_manual = isinstance(chat_id, int) and chat_id > 0
+    if not is_manual and not is_valid_message_link(link):
+        return False, "no_link"
 
     created_at = msg_date_utc if msg_date_utc.tzinfo else msg_date_utc.replace(tzinfo=timezone.utc)
 
@@ -706,6 +902,9 @@ async def save_truck_ad(chat_id, message_id, chat_title, chat_username, text, ms
 
     text_norm  = normalize_text(text).lower()
     text_short = shorten_text(text, 160)
+    saved_at   = now_utc()
+    expires_at = saved_at + timedelta(days=AD_TTL_DAYS)
+    updated_at = saved_at
 
     async with get_pool().acquire() as conn:
         exists = await conn.fetchval(
@@ -734,18 +933,37 @@ async def save_truck_ad(chat_id, message_id, chat_title, chat_username, text, ms
                    $10,$11,$12,$13,$14,$15,$16,
                    $17,true,$18,$19,$20
                )
-               on conflict(ad_id) do nothing""",
+               on conflict(ad_id) do update set
+                   source_chat_id=excluded.source_chat_id,
+                   source_message_id=excluded.source_message_id,
+                   source_key=excluded.source_key,
+                   source_title=excluded.source_title,
+                   source_username=excluded.source_username,
+                   text_full=excluded.text_full,
+                   text_short=excluded.text_short,
+                   text_norm=excluded.text_norm,
+                   vehicle=excluded.vehicle,
+                   phone=excluded.phone,
+                   weight=excluded.weight,
+                   country=excluded.country,
+                   country_label=excluded.country_label,
+                   region=excluded.region,
+                   region_label=excluded.region_label,
+                   link=excluded.link,
+                   active=true,
+                   updated_at=excluded.updated_at,
+                   expires_at=excluded.expires_at""",
             ad_id, chat_id, message_id, source_key(chat_id, message_id),
             chat_title, chat_username,
             text, text_short, text_norm,
             vehicle, phone, weight,
             country_id, country_label, region_id, region_label,
-            link, created_at, now_utc(), created_at + timedelta(days=AD_TTL_DAYS),
+            link, created_at, updated_at, expires_at,
         )
 
     log.info(
-        "truck SAVED chat=%s msg=%s vehicle=%s country=%s region=%s",
-        chat_id, message_id, vehicle, country_id, region_id
+        "truck SAVED chat=%s msg=%s vehicle=%s country=%s region=%s link=%s",
+        chat_id, message_id, vehicle, country_id, region_id, bool(link)
     )
     return True, "saved"
 
@@ -861,6 +1079,16 @@ class Register(StatesGroup):
 class CargoSearch(StatesGroup):
     waiting_place = State()
 
+class AdminPostAd(StatesGroup):
+    choosing_type    = State()
+    waiting_text     = State()
+    confirm          = State()
+
+class UserPostAd(StatesGroup):
+    choosing_type    = State()
+    waiting_text     = State()
+    confirm          = State()
+
 def kb_request_contact():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -871,14 +1099,15 @@ def kb_request_contact():
         one_time_keyboard=True
     )
 
-def kb_main_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📦 Yuk e'lonlari")],
-            [KeyboardButton(text="🚚 Yuk mashinalar e'lonlari")]
-        ],
-        resize_keyboard=True
-    )
+def kb_main_menu(uid: int = 0):
+    rows = [
+        [KeyboardButton(text="📦 Yuk e'lonlari")],
+        [KeyboardButton(text="🚚 Yuk mashinalar e'lonlari")],
+        [KeyboardButton(text="📝 E'lon joylash")],
+    ]
+    if is_admin(uid):
+        rows.append([KeyboardButton(text="🛠 Admin Panel")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def kb_cancel():
     return ReplyKeyboardMarkup(
@@ -1085,17 +1314,33 @@ async def start(message: types.Message, state: FSMContext):
         return
 
     uid = message.from_user.id
+    await log_visit(uid)
+
     if await is_registered(uid):
         await state.clear()
         await message.answer(
             f"✅ <b>{escape_html(BOT_NAME)}</b>\n\nMenyu:",
             parse_mode="HTML",
-            reply_markup=kb_main_menu(),
+            reply_markup=kb_main_menu(uid),
         )
         return
 
     await state.set_state(Register.waiting_fullname)
     await send_welcome_media(message)
+
+@dp.message(F.text == "🛠 Admin Panel")
+async def admin_panel_button(message: types.Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔️ Sizda admin huquqi yo'q.")
+        return
+    await state.clear()
+    await message.answer(
+        "🛠 <b>Admin Panel</b>\n\nQuyidagi bo'limlardan birini tanlang:",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu()
+    )
 
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel(message: types.Message, state: FSMContext):
@@ -1149,7 +1394,7 @@ async def got_contact(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ Ro'yxatdan o'tdingiz, <b>{escape_html(fullname)}</b>!\n\nMenyu:",
         parse_mode="HTML",
-        reply_markup=kb_main_menu()
+        reply_markup=kb_main_menu(uid)
     )
 
 @dp.message(Register.waiting_contact)
@@ -1160,6 +1405,130 @@ async def contact_required(message: types.Message):
 async def fullname_required(message: types.Message):
     await message.answer("👤 Ism familiyangizni kiriting. Masalan: Ali Valiyev")
 
+@dp.message(F.text == "📝 E'lon joylash")
+async def user_post_ad_start(message: types.Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
+    if not await is_registered(message.from_user.id):
+        await message.answer("Avval /start orqali ro'yxatdan o'ting.")
+        return
+    await log_visit(message.from_user.id)
+    await state.set_state(UserPostAd.choosing_type)
+    await message.answer(
+        "📝 <b>E'lon turini tanlang:</b>",
+        parse_mode="HTML",
+        reply_markup=kb_ad_type()
+    )
+
+
+@dp.message(UserPostAd.choosing_type, F.text.in_(["📦 Yuk e'loni", "🚚 Mashina e'loni"]))
+async def user_choose_ad_type(message: types.Message, state: FSMContext):
+    ad_type = "cargo" if "Yuk" in message.text else "truck"
+    await state.update_data(ad_type=ad_type)
+    await state.set_state(UserPostAd.waiting_text)
+
+    example = (
+        "Yuk bor\nToshkent - Moskva\n20 tonna\nKartoshka\nTel: +998 90 123 45 67"
+        if ad_type == "cargo"
+        else "Mashina bor\nFura tent\nToshkent - Buxoro\nTel: +998 90 123 45 67"
+    )
+    await message.answer(
+        f"✍️ <b>E'lon matnini yozing:</b>\n\n<i>Misol:</i>\n<code>{example}</code>",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
+    )
+
+
+@dp.message(UserPostAd.choosing_type, F.text == "🔙 Admin panel")
+async def user_post_back_to_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Menyu:", reply_markup=kb_main_menu(message.from_user.id))
+
+
+@dp.message(UserPostAd.waiting_text, F.text)
+async def user_ad_text_entered(message: types.Message, state: FSMContext):
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Menyu:", reply_markup=kb_main_menu(message.from_user.id))
+        return
+
+    text = message.text.strip()
+    if len(text) < 10:
+        await message.answer("E'lon matni kamida 10 ta belgi bo'lishi kerak.")
+        return
+
+    await state.update_data(ad_text=text)
+    await state.set_state(UserPostAd.confirm)
+
+    data = await state.get_data()
+    ad_type_label = "📦 Yuk" if data["ad_type"] == "cargo" else "🚚 Mashina"
+    await message.answer(
+        f"📋 <b>E'lon tekshiruvi:</b>\n\n"
+        f"<b>Turi:</b> {ad_type_label}\n"
+        f"<b>Matn:</b>\n{escape_html(text)}\n\n"
+        f"Joylashni tasdiqlaysizmi?",
+        parse_mode="HTML",
+        reply_markup=kb_confirm_ad()
+    )
+
+
+@dp.message(UserPostAd.confirm, F.text == "✅ Tasdiqlash")
+async def user_confirm_ad(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ad_type = data["ad_type"]
+    ad_text = data["ad_text"]
+    uid = message.from_user.id
+    msg_date = now_utc()
+    fake_msg_id = int(uuid.uuid4().int % 2_000_000_000)
+
+    if ad_type == "cargo":
+        ok, status = await save_cargo_ad(
+            chat_id=uid, message_id=fake_msg_id,
+            chat_title="Bot - Foydalanuvchi",
+            chat_username=None,
+            text=ad_text,
+            msg_date_utc=msg_date
+        )
+    else:
+        ok, status = await save_truck_ad(
+            chat_id=uid, message_id=fake_msg_id,
+            chat_title="Bot - Foydalanuvchi",
+            chat_username=None,
+            text=ad_text,
+            msg_date_utc=msg_date
+        )
+
+    # Manual ads ga ham yozish
+    manual_expires = now_utc() + timedelta(days=AD_TTL_DAYS)
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO manual_ads(ad_type, text_full, posted_by, expires_at) VALUES($1, $2, $3, $4)",
+            ad_type, ad_text, uid, manual_expires
+        )
+
+    await state.clear()
+
+    if ok:
+        await message.answer(
+            "✅ <b>E'loningiz muvaffaqiyatli joylashtirildi!</b>",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu(message.from_user.id)
+        )
+    else:
+        await message.answer(
+            "✅ <b>E'loningiz qabul qilindi!</b>\n\n"
+            "(E'lon moderatsiyadan keyin ko'rinadi)",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu(message.from_user.id)
+        )
+
+
+@dp.message(UserPostAd.confirm, F.text == "❌ Bekor qilish")
+async def user_cancel_ad(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=kb_main_menu(message.from_user.id))
+
+
 @dp.message(F.text == "📦 Yuk e'lonlari")
 async def cargo_menu(message: types.Message, state: FSMContext):
     if message.chat.type != "private":
@@ -1167,6 +1536,7 @@ async def cargo_menu(message: types.Message, state: FSMContext):
     if not await is_registered(message.from_user.id):
         await message.answer("Avval /start orqali ro'yxatdan o'ting.")
         return
+    await log_visit(message.from_user.id)
 
     # Oldingi detail xabarlarini tozalash
     uid = message.from_user.id
@@ -1190,7 +1560,7 @@ async def cargo_menu(message: types.Message, state: FSMContext):
 async def cargo_place_entered(message: types.Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-        await message.answer("Menyu:", reply_markup=kb_main_menu())
+        await message.answer("Menyu:", reply_markup=kb_main_menu(message.from_user.id))
         return
 
     raw = normalize_text(message.text)
@@ -1203,7 +1573,7 @@ async def cargo_place_entered(message: types.Message, state: FSMContext):
     place2 = parts[1] if len(parts) > 1 else None
 
     await state.clear()
-    await message.answer("🔎 Qidiryapman...", reply_markup=kb_main_menu())
+    await message.answer("🔎 Qidiryapman...", reply_markup=kb_main_menu(message.from_user.id))
 
     sid = make_session_id()
     SEARCH_SESSIONS[sid] = {
@@ -1300,6 +1670,402 @@ async def cargo_detail(callback: types.CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  ADMIN PANEL
+# ═══════════════════════════════════════════════════════════════════════
+
+def kb_admin_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="👥 Foydalanuvchilar")],
+            [KeyboardButton(text="📅 Oylik hisobot"), KeyboardButton(text="📈 Tashriflar")],
+            [KeyboardButton(text="📝 Qo'lda e'lon qo'shish"), KeyboardButton(text="🗑 E'lonlarni boshqarish")],
+            [KeyboardButton(text="🔙 Asosiy menyu")],
+        ],
+        resize_keyboard=True
+    )
+
+def kb_ad_type():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📦 Yuk e'loni"), KeyboardButton(text="🚚 Mashina e'loni")],
+            [KeyboardButton(text="❌ Bekor qilish")],
+        ],
+        resize_keyboard=True
+    )
+
+def kb_confirm_ad():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Tasdiqlash"), KeyboardButton(text="❌ Bekor qilish")],
+        ],
+        resize_keyboard=True
+    )
+
+
+@dp.message(Command("admin"))
+async def admin_panel_cmd(message: types.Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔️ Sizda admin huquqi yo'q.")
+        return
+    await state.clear()
+    await message.answer(
+        "🛠 <b>Admin Panel</b>\n\nQuyidagi bo'limlardan birini tanlang:",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu()
+    )
+
+
+@dp.message(F.text == "🔙 Admin panel")
+async def back_to_admin(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("🛠 <b>Admin Panel</b>", parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+@dp.message(F.text == "🔙 Asosiy menyu")
+async def back_to_main(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Menyu:", reply_markup=kb_main_menu(message.from_user.id))
+
+
+@dp.message(F.text == "📊 Statistika")
+async def admin_stats(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with get_pool().acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE registered=true")
+        total_cargo = await conn.fetchval("SELECT COUNT(*) FROM cargo_ads WHERE active=true")
+        total_truck = await conn.fetchval("SELECT COUNT(*) FROM truck_ads WHERE active=true")
+        today_visits = await conn.fetchval(
+            "SELECT COUNT(*) FROM visits WHERE visited_at >= CURRENT_DATE"
+        )
+        today_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= CURRENT_DATE"
+        )
+        manual_ads = await conn.fetchval("SELECT COUNT(*) FROM manual_ads WHERE active=true")
+
+    text = (
+        "📊 <b>Umumiy Statistika</b>\n\n"
+        f"👥 <b>Jami foydalanuvchilar:</b> {total_users}\n"
+        f"🆕 <b>Bugungi yangi userlar:</b> {today_users}\n"
+        f"👁 <b>Bugungi tashriflar:</b> {today_visits}\n\n"
+        f"📦 <b>Faol yuk e'lonlari:</b> {total_cargo}\n"
+        f"🚚 <b>Faol mashina e'lonlari:</b> {total_truck}\n"
+        f"📝 <b>Admin e'lonlari:</b> {manual_ads}\n"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+@dp.message(F.text == "👥 Foydalanuvchilar")
+async def admin_users(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with get_pool().acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM users WHERE registered=true")
+        recent = await conn.fetch(
+            "SELECT uid, fullname, phone, tg_username, created_at "
+            "FROM users WHERE registered=true ORDER BY created_at DESC LIMIT 10"
+        )
+
+    lines = [f"👥 <b>Foydalanuvchilar</b> (jami: {total})\n\n<b>Oxirgi 10 ta:</b>\n"]
+    for i, r in enumerate(recent, 1):
+        name = r["fullname"] or "—"
+        phone = r["phone"] or "—"
+        username = f"@{r['tg_username']}" if r["tg_username"] else "—"
+        dt = r["created_at"].strftime("%d.%m.%Y") if r["created_at"] else "—"
+        lines.append(
+            f"{i}. {escape_html(name)}\n"
+            f"   📞 {escape_html(phone)} | {escape_html(username)}\n"
+            f"   📅 {dt}\n"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+@dp.message(F.text == "📅 Oylik hisobot")
+async def admin_monthly_report(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with get_pool().acquire() as conn:
+        # Oxirgi 6 oy statistikasi
+        monthly = await conn.fetch("""
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') as month,
+                COUNT(*) as cnt
+            FROM users
+            WHERE registered=true AND created_at >= NOW() - INTERVAL '6 months'
+            GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+            ORDER BY month DESC
+        """)
+        cargo_monthly = await conn.fetch("""
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') as month,
+                COUNT(*) as cnt
+            FROM cargo_ads
+            WHERE created_at >= NOW() - INTERVAL '6 months'
+            GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+            ORDER BY month DESC
+        """)
+        truck_monthly = await conn.fetch("""
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') as month,
+                COUNT(*) as cnt
+            FROM truck_ads
+            WHERE created_at >= NOW() - INTERVAL '6 months'
+            GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+            ORDER BY month DESC
+        """)
+
+    lines = ["📅 <b>Oylik Hisobot</b> (oxirgi 6 oy)\n"]
+
+    lines.append("\n<b>👥 Yangi foydalanuvchilar:</b>")
+    for r in monthly:
+        lines.append(f"  {r['month']}: <b>{r['cnt']}</b> ta")
+
+    lines.append("\n<b>📦 Yuk e'lonlari:</b>")
+    for r in cargo_monthly:
+        lines.append(f"  {r['month']}: <b>{r['cnt']}</b> ta")
+
+    lines.append("\n<b>🚚 Mashina e'lonlari:</b>")
+    for r in truck_monthly:
+        lines.append(f"  {r['month']}: <b>{r['cnt']}</b> ta")
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+@dp.message(F.text == "📈 Tashriflar")
+async def admin_visits(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with get_pool().acquire() as conn:
+        today = await conn.fetchval(
+            "SELECT COUNT(*) FROM visits WHERE visited_at >= CURRENT_DATE"
+        )
+        week = await conn.fetchval(
+            "SELECT COUNT(*) FROM visits WHERE visited_at >= CURRENT_DATE - INTERVAL '7 days'"
+        )
+        month = await conn.fetchval(
+            "SELECT COUNT(*) FROM visits WHERE visited_at >= CURRENT_DATE - INTERVAL '30 days'"
+        )
+        unique_today = await conn.fetchval(
+            "SELECT COUNT(DISTINCT uid) FROM visits WHERE visited_at >= CURRENT_DATE"
+        )
+        unique_week = await conn.fetchval(
+            "SELECT COUNT(DISTINCT uid) FROM visits WHERE visited_at >= CURRENT_DATE - INTERVAL '7 days'"
+        )
+        unique_month = await conn.fetchval(
+            "SELECT COUNT(DISTINCT uid) FROM visits WHERE visited_at >= CURRENT_DATE - INTERVAL '30 days'"
+        )
+        # Kunlik tashriflar oxirgi 7 kun
+        daily = await conn.fetch("""
+            SELECT
+                TO_CHAR(visited_at, 'DD.MM') as day,
+                COUNT(*) as total,
+                COUNT(DISTINCT uid) as unique_cnt
+            FROM visits
+            WHERE visited_at >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY TO_CHAR(visited_at, 'DD.MM'), DATE(visited_at)
+            ORDER BY DATE(visited_at) DESC
+        """)
+
+    lines = [
+        "📈 <b>Tashriflar Statistikasi</b>\n",
+        f"<b>Bugun:</b> {today} ta tashrif ({unique_today} unique)",
+        f"<b>Hafta:</b> {week} ta tashrif ({unique_week} unique)",
+        f"<b>Oy:</b> {month} ta tashrif ({unique_month} unique)",
+        "\n<b>Kunlik (oxirgi 7 kun):</b>",
+    ]
+    for r in daily:
+        lines.append(f"  {r['day']}: {r['total']} tashrif ({r['unique_cnt']} unique)")
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+# ─────── E'lon joylash ───────
+
+@dp.message(F.text == "📝 Qo'lda e'lon qo'shish")
+async def admin_post_ad_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminPostAd.choosing_type)
+    await message.answer(
+        "📝 <b>E'lon turini tanlang:</b>",
+        parse_mode="HTML",
+        reply_markup=kb_ad_type()
+    )
+
+
+@dp.message(AdminPostAd.choosing_type, F.text.in_(["📦 Yuk e'loni", "🚚 Mashina e'loni"]))
+async def admin_choose_ad_type(message: types.Message, state: FSMContext):
+    ad_type = "cargo" if "Yuk" in message.text else "truck"
+    await state.update_data(ad_type=ad_type)
+    await state.set_state(AdminPostAd.waiting_text)
+
+    example = (
+        "Yuk bor\nToshkent - Moskva\n20 tonna\nKartoshka\nTel: +998 90 123 45 67"
+        if ad_type == "cargo"
+        else "Mashina bor\nFura tent\nToshkent - Buxoro\nTel: +998 90 123 45 67"
+    )
+    await message.answer(
+        f"✍️ <b>E'lon matnini yozing:</b>\n\n<i>Misol:</i>\n<code>{example}</code>",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
+    )
+
+
+@dp.message(AdminPostAd.choosing_type, F.text == "❌ Bekor qilish")
+async def admin_post_back(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🛠 <b>Admin Panel</b>", parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+@dp.message(AdminPostAd.waiting_text, F.text)
+async def admin_ad_text_entered(message: types.Message, state: FSMContext):
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("🛠 <b>Admin Panel</b>", parse_mode="HTML", reply_markup=kb_admin_menu())
+        return
+
+    text = message.text.strip()
+    if len(text) < 10:
+        await message.answer("E'lon matni kamida 10 ta belgi bo'lishi kerak.")
+        return
+
+    await state.update_data(ad_text=text)
+    await state.set_state(AdminPostAd.confirm)
+
+    data = await state.get_data()
+    ad_type_label = "📦 Yuk" if data["ad_type"] == "cargo" else "🚚 Mashina"
+    await message.answer(
+        f"📋 <b>E'lon tekshiruvi:</b>\n\n"
+        f"<b>Turi:</b> {ad_type_label}\n"
+        f"<b>Matn:</b>\n{escape_html(text)}\n\n"
+        f"Joylashni tasdiqlaysizmi?",
+        parse_mode="HTML",
+        reply_markup=kb_confirm_ad()
+    )
+
+
+@dp.message(AdminPostAd.confirm, F.text == "✅ Tasdiqlash")
+async def admin_confirm_ad(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ad_type = data["ad_type"]
+    ad_text = data["ad_text"]
+    uid = message.from_user.id
+
+    msg_date = now_utc()
+    fake_msg_id = int(uuid.uuid4().int % 2_000_000_000)
+
+    # Ma'lumotlar bazasiga saqlash
+    if ad_type == "cargo":
+        ok, status = await save_cargo_ad(
+            chat_id=uid, message_id=fake_msg_id,
+            chat_title="Admin Panel",
+            chat_username=None,
+            text=ad_text,
+            msg_date_utc=msg_date
+        )
+    else:
+        ok, status = await save_truck_ad(
+            chat_id=uid, message_id=fake_msg_id,
+            chat_title="Admin Panel",
+            chat_username=None,
+            text=ad_text,
+            msg_date_utc=msg_date
+        )
+
+    # Manual ads jadvaliga ham yozish
+    manual_expires = now_utc() + timedelta(days=AD_TTL_DAYS)
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO manual_ads(ad_type, text_full, posted_by, expires_at) VALUES($1, $2, $3, $4)",
+            ad_type, ad_text, uid, manual_expires
+        )
+
+    await state.clear()
+
+    if ok:
+        await message.answer(
+            "✅ <b>E'lon muvaffaqiyatli joylashtirildi!</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu()
+        )
+    else:
+        await message.answer(
+            f"⚠️ E'lon saqlandi (manual_ads), lekin asosiy bazaga yozilmadi.\n"
+            f"Sabab: {status}\n\n"
+            f"(E'lon matni filterga mos kelmagan bo'lishi mumkin. Manual_ads da saqlangan.)",
+            reply_markup=kb_admin_menu()
+        )
+
+
+@dp.message(AdminPostAd.confirm, F.text == "❌ Bekor qilish")
+async def admin_cancel_ad(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=kb_admin_menu())
+
+
+@dp.message(F.text == "🗑 E'lonlarni boshqarish")
+async def admin_manage_ads(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with get_pool().acquire() as conn:
+        ads = await conn.fetch(
+            "SELECT id, ad_type, text_full, created_at, active FROM manual_ads "
+            "ORDER BY created_at DESC LIMIT 10"
+        )
+
+    if not ads:
+        await message.answer("📝 Hozircha admin e'lonlari yo'q.", reply_markup=kb_admin_menu())
+        return
+
+    lines = ["🗑 <b>Admin e'lonlari</b> (oxirgi 10 ta)\n"]
+    buttons = []
+    for r in ads:
+        status = "✅" if r["active"] else "❌"
+        ad_type_icon = "📦" if r["ad_type"] == "cargo" else "🚚"
+        dt = r["created_at"].strftime("%d.%m %H:%M") if r["created_at"] else "—"
+        short = shorten_text(r["text_full"], 60)
+        lines.append(f"{status} {ad_type_icon} [{r['id']}] {dt}\n   {escape_html(short)}\n")
+        if r["active"]:
+            buttons.append([InlineKeyboardButton(
+                text=f"🗑 O'chirish #{r['id']}",
+                callback_data=f"admin_del_ad:{r['id']}"
+            )])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("admin_del_ad:"))
+async def admin_delete_ad(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Ruxsat yo'q", show_alert=True)
+        return
+
+    try:
+        ad_id = int(callback.data.split(":")[1])
+    except Exception:
+        await callback.answer("Xato", show_alert=True)
+        return
+
+    async with get_pool().acquire() as conn:
+        await conn.execute("UPDATE manual_ads SET active=false WHERE id=$1", ad_id)
+
+    await callback.answer("✅ E'lon o'chirildi")
+    # Xabarni yangilash
+    try:
+        await callback.message.edit_text(
+            callback.message.text + f"\n\n✅ #{ad_id} o'chirildi",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  TELETHON
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1317,9 +2083,13 @@ async def get_chat_info_cached(chat_id: int) -> Tuple[str, Optional[str]]:
     CHAT_CACHE[chat_id] = (title, username, now_ts + CHAT_CACHE_TTL)
     return title, username
 
-@telethon_client.on(events.NewMessage)
+@telethon_client.on(events.NewMessage(incoming=True))
 async def on_new_message(event: events.NewMessage.Event):
     try:
+        # Faqat guruh / kanal / supergroup — shaxsiy chatlarni o'tkazib yuboramiz
+        if not (event.is_group or event.is_channel):
+            return
+
         msg = event.message
         if not msg or not msg.message:
             return
@@ -1341,8 +2111,14 @@ async def on_new_message(event: events.NewMessage.Event):
             "chat_id": event.chat_id,
             "message_id": msg.id,
             "text": text,
-            "msg_date": msg_date
+            "msg_date": msg_date,
+            "is_cargo": cargo,
+            "is_truck": truck,
         })
+        log.debug(
+            "INGEST queued chat=%s msg=%s cargo=%s truck=%s",
+            event.chat_id, msg.id, cargo, truck
+        )
     except asyncio.QueueFull:
         log.warning("INGEST_QUEUE full")
     except Exception:
@@ -1377,33 +2153,46 @@ async def ingest_worker(worker_id: int):
         if not buf:
             return
         cargo_n = truck_n = 0
+        skip_n = 0
         for it in buf:
             saved_as_cargo = False
             try:
-                ok, _ = await save_cargo_ad(
+                ok, status = await save_cargo_ad(
                     it["chat_id"], it["message_id"], it["chat_title"],
                     it["chat_username"], it["text"], it["msg_date"]
                 )
                 if ok:
                     cargo_n += 1
                     saved_as_cargo = True
+                elif status not in ("filtered",):
+                    log.info(
+                        "cargo skip chat=%s msg=%s status=%s",
+                        it["chat_id"], it["message_id"], status
+                    )
+                    skip_n += 1
             except Exception:
                 log.exception("save_cargo_ad error")
 
             if not saved_as_cargo:
                 try:
-                    ok2, _ = await save_truck_ad(
+                    ok2, status2 = await save_truck_ad(
                         it["chat_id"], it["message_id"], it["chat_title"],
                         it["chat_username"], it["text"], it["msg_date"]
                     )
                     if ok2:
                         truck_n += 1
+                    elif status2 not in ("filtered",):
+                        log.info(
+                            "truck skip chat=%s msg=%s status=%s username=%s",
+                            it["chat_id"], it["message_id"], status2, it.get("chat_username")
+                        )
+                        skip_n += 1
                 except Exception:
                     log.exception("save_truck_ad error")
 
         log.info(
-            "worker[%s] flushed=%s cargo=%s truck=%s queue=%s",
-            worker_id, len(buf), cargo_n, truck_n, INGEST_QUEUE.qsize()
+            "worker[%s] flushed=%s cargo=%s truck=%s skip=%s queue=%s",
+            worker_id, len(buf), cargo_n, truck_n, skip_n, INGEST_QUEUE.qsize()
         )
 
     while True:
@@ -1446,18 +2235,22 @@ async def expire_sweeper():
         try:
             async with get_pool().acquire() as conn:
                 c1 = await conn.fetchval(
-                    "with t as (update cargo_ads set active=false,updated_at=now() "
-                    "where active=true and expires_at<=now() returning 1) select count(*) from t"
+                    "with t as (delete from cargo_ads "
+                    "where expires_at <= now() returning 1) select count(*) from t"
                 )
                 c2 = await conn.fetchval(
-                    "with t as (update truck_ads set active=false,updated_at=now() "
-                    "where active=true and expires_at<=now() returning 1) select count(*) from t"
+                    "with t as (delete from truck_ads "
+                    "where expires_at <= now() returning 1) select count(*) from t"
                 )
                 c3 = await conn.fetchval(
                     "with t as (delete from dedup_hashes where expires_at<=now() returning 1) select count(*) from t"
                 )
-            if c1 or c2 or c3:
-                log.info("cleanup cargo=%s truck=%s dedup=%s", c1, c2, c3)
+                c4 = await conn.fetchval(
+                    "with t as (delete from manual_ads "
+                    "where expires_at is not null and expires_at <= now() returning 1) select count(*) from t"
+                )
+            if c1 or c2 or c3 or c4:
+                log.info("cleanup cargo=%s truck=%s dedup=%s manual=%s", c1, c2, c3, c4)
         except Exception:
             log.exception("expire_sweeper error")
         await asyncio.sleep(EXPIRE_SWEEP_EVERY)
@@ -1505,7 +2298,23 @@ async def run_telethon_forever():
             if not await telethon_client.is_user_authorized():
                 raise RuntimeError("TG_SESSION noto'g'ri.")
             me = await telethon_client.get_me()
-            log.info("Telethon connected @%s", getattr(me, "username", None))
+            is_bot_session = bool(getattr(me, "bot", False))
+            group_n = None
+            if not is_bot_session:
+                try:
+                    dialogs = await telethon_client.get_dialogs(limit=50)
+                    group_n = sum(1 for d in dialogs if d.is_group or d.is_channel)
+                except Exception:
+                    log.exception("get_dialogs failed (listeners still active)")
+            else:
+                log.error(
+                    "TG_SESSION bot akkaunti! Guruhlardan e'lon olish uchun USER session kerak."
+                )
+            log.info(
+                "Telethon connected @%s id=%s bot=%s recent_groups_channels=%s",
+                getattr(me, "username", None), getattr(me, "id", None),
+                is_bot_session, group_n,
+            )
             await telethon_client.run_until_disconnected()
         except FloodWaitError as e:
             await asyncio.sleep(int(getattr(e, "seconds", 60)) + 5)
